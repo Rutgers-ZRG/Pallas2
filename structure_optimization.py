@@ -1,42 +1,54 @@
-import pickle
-import numpy as np
-from nequip.ase.nequip_calculator import nequip_calculator
-import matplotlib.pyplot as plt
-from ase.io import read, write, Trajectory
-from ase.build.supercells import make_supercell
-from ase.optimize import LBFGS, FIRE
-from ase.visualize import view
+import os
+import torch
+from loguru import logger
+from ase import io
+from ase.optimize import FIRE, BFGS
+from ase.constraints import ExpCellFilter
+from mattersim.forcefield import MatterSimCalculator
 from pymatgen.io.ase import AseAtomsAdaptor
 from pymatgen.symmetry.analyzer import SpacegroupAnalyzer
-from ase.constraints import ExpCellFilter
-from custom_calc_mixed import Custom_Nequip_Calc
-from ase.build.tools import niggli_reduce, sort
-from scipy.optimize import linear_sum_assignment
+
+device = "cpu"
+
+#use mattersim instead
+
+def load_calculator():
+    return MatterSimCalculator(device=device)
 
 def print_spacegroup(atom):
-  print(SpacegroupAnalyzer(AseAtomsAdaptor().get_structure(atom), symprec=1e-5).get_space_group_symbol())
+    try:
+        spg_analyzer = SpacegroupAnalyzer(AseAtomsAdaptor().get_structure(atom), symprec=1e-3)
+        print("Space group:", spg_analyzer.get_space_group_symbol())
+    except Exception as e:
+        print("Failed to determine space group:", e)
 
-nequip_ef_path = "model/cdse_energy_force_model.pth"
-nequip_s_path = "model/cdse_stress_model.pth"
+filename = "POSCAR2"
+structure = io.read(filename, format="vasp")
 
+calc = load_calculator()
+structure.calc = calc
 
-calc  = Custom_Nequip_Calc(nequip_ef_calc_path=nequip_ef_path, nequip_s_calc_path=nequip_s_path)
+try:
+    energy = structure.get_potential_energy()
+    forces = structure.get_forces()
+    stress = structure.get_stress()
+    print(f"Energy: {energy:.6f} eV")
+    print("Forces:\n", forces)
+    print("Stress:\n", stress)
+except Exception as e:
+    print("Error in calculating properties:", e)
+    exit()
 
+print_spacegroup(structure)
 
-atom = read("POSCAR2", format="vasp")
-atom.calc = calc
+ecf = ExpCellFilter(structure)  
+dyn = BFGS(ecf, trajectory="optim.traj")
+success = dyn.run(fmax=0.01, steps=500)
 
-print(atom.get_potential_energy())
-print(atom.get_forces())
-print(atom.get_stress())
-print_spacegroup(atom)
+if not success:
+    logger.warning("Optimization exceeded 500 steps and was skipped.")
+else:
+    print_spacegroup(structure)
+    io.write("POSCAR_OPTIMIZED", structure, format="vasp")
+    logger.info("Optimized structure saved as POSCAR_OPTIMIZED")
 
-#
-#ecf = ExpCellFilter(atom)
-ecf = atom
-dyn = FIRE(ecf, trajectory="optim.traj")
-dyn.run(fmax=0.01)
-
-print_spacegroup(atom)
-
-write("POSCAR_OPTIMIZED", atom, format='vasp', direct=True)
