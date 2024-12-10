@@ -1,4 +1,3 @@
-
 import sys
 import os
 import socket
@@ -11,7 +10,8 @@ import networkx as nx
 import joblib
 from tsase.neb.util import vunit, vrand
 import random
-
+import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation
 import fplib2
 import time
 
@@ -43,6 +43,8 @@ class Pallas(object):
         # num_init_min = 2 # for testing
         self.init_minima = self.read_init_structure(flist)
         self.num_init_min = len(self.init_minima)
+        visualizer = GraphVisualizer(G)
+        visualizer.animate(frames=10, interval=1000)
 
     def read_init_structure(self, flist):
         init_minima = []
@@ -53,7 +55,9 @@ class Pallas(object):
         return init_minima
     
     def run(self):
+        """Main loop to optimize minima and calculate saddle points."""
         xlist = []
+
         # Iterate through initial minima
         for i in range(self.num_init_min):
             # Optimize the initial structure
@@ -586,8 +590,40 @@ def test():
     # print (np.max(np.abs(fff)))
     # print (optatom.converged)
 
+class GraphVisualizer:
+    def __init__(self, graph):
+        """
+        Initializes the graph visualization with a given graph.
+        
+        :param graph: The graph to visualize (networkx.Graph)
+        """
+        self.graph = graph
+        self.fig, self.ax = plt.subplots(figsize=(8, 6))
+        self.pos = nx.spring_layout(graph)
+        self.node_size = 500
+        self.node_color = 'lightblue'
+        self.edge_color = 'gray'
 
+    def draw_graph(self):
+        nx.draw_networkx_nodes(self.graph, self.pos, node_size=self.node_size, node_color=self.node_color, ax=self.ax)
+        nx.draw_networkx_edges(self.graph, self.pos, width=1, edge_color=self.edge_color, ax=self.ax)
+        nx.draw_networkx_labels(self.graph, self.pos, font_size=12, font_weight='bold', ax=self.ax)
+        plt.title("Dynamic Graph Visualization")
 
+    def update(self, frame):
+        #Updates the graph for a given frame in the animation. 
+        self.ax.clear()
+        
+        self.graph.add_node(frame)
+        if frame > 0:
+            self.graph.add_edge(frame-1, frame)
+        
+        self.draw_graph()
+        self.ax.set_title(f"Frame {frame}", fontsize=16)
+
+    def animate(self, frames=10, interval=1000):
+        ani = FuncAnimation(self.fig, self.update, frames=frames, interval=interval, repeat=False)
+        plt.show()
 
 
 
