@@ -14,27 +14,71 @@ import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
 import fplib2
 import time
+from collections import deque  # Added for pathfinding
 
 from nequipcal import local_optimization, cal_saddle
 
 class Pallas(object):
-    def __init__(self):
-        self.init_minima = []
-        self.ipso = []
-        self.all_minima = []
-        self.all_saddle = []
-        self.fpcutoff = 5.5
-        self.lmax = 0
-        self.natx = 200
-        self.ntyp = 2
-        self.types = np.array([1,1,1,1,2,2,2,2])
-        self.dij = np.zeros((10000, 10000), float)
-        self.baseenergy = 0.0
-        self.G = nx.Graph()
-        self.press = 0.0
-        self.maxstep = 50
-        self.popsize = 10
+    def __init__(self, popsize=10, maxstep=50, press=0.0, fpcutoff=5.5, lmax=0, natx=200, ntyp=2, types=None):
+        """Initialize the Pallas PSO search.
+
+        Args:
+            popsize (int): Population size for PSO.
+            maxstep (int): Maximum number of PSO steps.
+            press (float): External pressure.
+            fpcutoff (float): Cutoff radius for fingerprints.
+            lmax (int): Maximum l value for fingerprints.
+            natx (int): Maximum number of atoms expected (for FP array size).
+            ntyp (int): Number of atom types.
+            types (np.ndarray): Array mapping atom index to type index (1-based).
+        """
+        self.popsize = popsize
+        self.maxstep = maxstep
+        self.press = press
+        self.fpcutoff = fpcutoff
+        self.lmax = lmax
+        self.natx = natx # Note: PallasAtom uses a hardcoded natx=200, needs sync
+        self.ntyp = ntyp
+        # Default types if none provided (example: 4 of type 1, 4 of type 2)
+        self.types = types if types is not None else np.array([1]*4 + [2]*4) 
         
+        self.db = None # Database connection, initialized in init_run
+        self.G = nx.Graph() # Graph to store minima and saddles
+        self.baseenergy = 0.0 # Reference energy (usually reactant energy)
+        self.reactant = None # Reactant structure (PallasAtom)
+        self.product = None # Product structure (PallasAtom)
+        self.reactant_id = None
+        self.product_id = None
+
+        # PSO State Variables (initialize as empty lists)
+        # These will hold data for each particle in the population (size = popsize)
+        self.stepx_particles = [] # List of ParticleState objects for reactant side
+        self.stepy_particles = [] # List of ParticleState objects for product side
+
+        # Global best found so far (connecting reactant and product)
+        self.gbest_particle_x = None # Best particle state from reactant side leading to connection
+        self.gbest_particle_y = None # Best particle state from product side leading to connection
+        self.gbest_distance = float('inf') # Best fingerprint distance found between sides
+        self.gbest_barrier = float('inf') # Lowest barrier found for a connected path
+
+        # Keep track of all minima/saddles found (optional, maybe handled by db/graph)
+        # self.all_minima_map = {} # Store minima by ID
+        # self.all_saddle_map = {} # Store saddles by ID 
+
+        # Distance matrix (potentially large, consider if needed or use on-the-fly calcs)
+        # self.dij = np.zeros((10000, 10000), float) 
+        # self.dij[:][:] = 1000.
+        # np.fill_diagonal(self.dij, 0.0)
+
+
+# Helper class to store state for each particle in PSO
+class ParticleState:
+    def __init__(self):
+        self.min = None        # Current minimum structure (PallasAtom)
+        self.sad = None        # Saddle point generated from self.min (PallasAtom)
+        self.v = None          # PSO velocity (mode for perturbation)
+        self.pbest = None      # Personal best minimum structure found (PallasAtom)
+        self.pbest_distance = float('inf') # Best distance to the *other* side for this particle's pbest
 
     def init_run(self, flist):
         self.db = ase.db.connect('pallas.json')
@@ -100,7 +144,8 @@ class Pallas(object):
                     h = sadx.get_volume()*self.press/1602.176487 + sadx.get_potential_energy() - self.baseenergy
                     volume = sadx.get_volume()
                     self.G.add_node(ids, xname='S'+str(ids), e=h, volume=volume)
-                    self.G.add_edge(idm, ids)
+                    # Add edge with weight (saddle energy)
+                    self.G.add_edge(idm, ids, weight=h)  
                     print(f"Added node: ID={ids}, Type=Saddle, Energy={h:.4f}, Volume={volume:.4f}")
                     print(f"Added edge: Minimum {idm} -> Saddle {ids}")
                     self.save_graph()
@@ -126,7 +171,9 @@ class Pallas(object):
                     h = new_min.get_volume()*self.press/1602.176487 + new_min.get_potential_energy() - self.baseenergy
                     volume = new_min.get_volume()
                     self.G.add_node(idm, xname=f'M{idm}', e=h, volume=volume)
-                    self.G.add_edge(saddle.id, idm)
+                    # Add edge with weight (saddle energy from which this minimum came)
+                    saddle_energy = self.G.nodes[saddle.id]['e'] # Get energy of the connecting saddle
+                    self.G.add_edge(saddle.id, idm, weight=saddle_energy) 
                     print(f"Added node: ID={idm}, Type=Minimum, Energy={h:.4f}, Volume={volume:.4f}")
                     print(f"Added edge: Saddle {saddle.id} -> Minimum {idm}")
                     self.save_graph()
@@ -144,7 +191,8 @@ class Pallas(object):
                         h = new_saddle.get_volume()*self.press/1602.176487 + new_saddle.get_potential_energy() - self.baseenergy
                         volume = new_saddle.get_volume()
                         self.G.add_node(ids, xname=f'S{ids}', e=h, volume=volume)
-                        self.G.add_edge(idm, ids)
+                        # Add edge with weight (saddle energy)
+                        self.G.add_edge(idm, ids, weight=h) 
                         print(f"Added node: ID={ids}, Type=Saddle, Energy={h:.4f}, Volume={volume:.4f}")
                         print(f"Added edge: Minimum {idm} -> Saddle {ids}")
                         self.save_graph()
@@ -414,44 +462,152 @@ def x2PAtom(xdb, x):
         
 
 
-def find_path(graph, start, end):
-    """
-    Find the minimax path between two given nodes in the Graph.
-    This function extracts the lowest-barrier paths with the least number of intermediate transition states.
-    
-    Args:
-    graph (networkx.Graph): The graph representing the energy landscape.
-    
-    Returns:
-    list: The minimax path between the two lowest energy minima.
-    """
-    # Find the two lowest energy minima
-    # minima = [node for node, data in graph.nodes(data=True) if data['xname'].startswith('M')]
-    # minima.sort(key=lambda x: graph.nodes[x]['e'])
-    # start, end = minima[:2]
-    
-    def minimax_cost(path):
-        """Calculate the minimax cost of a path."""
-        return max(graph.nodes[node]['e'] for node in path)
-    
-    def dfs_paths(start, end, path=None):
-        """Depth-first search to find all paths."""
-        if path is None:
-            path = [start]
-        if start == end:
-            yield path
-        for neighbor in graph.neighbors(start):
-            if neighbor not in path:
-                yield from dfs_paths(neighbor, end, path + [neighbor])
-    
-    # Find all paths and sort them by minimax cost and length
-    all_paths = list(dfs_paths(start, end))
-    all_paths.sort(key=lambda p: (minimax_cost(p), len(p)))
-    
-    # Return the path with the lowest minimax cost and least intermediate states
-    # return all_paths[0] if all_paths else None
-    return all_paths
+# --- Start: Minimax Pathfinding Code from barrier.py ---
 
+# 1. Union–Find with path-compression + union-by-rank
+class UnionFind:
+    __slots__ = ("p", "r")
+
+    def __init__(self, nodes):
+        self.p = {v: v for v in nodes}   # parent
+        self.r = {v: 0 for v in nodes}   # rank
+
+    def find(self, v):                   # iterative, path-compressed
+        p = self.p
+        while p[v] != v:
+            p[v] = p[p[v]]
+            v = p[v]
+        return v
+
+    def union(self, a, b):
+        ra, rb = self.find(a), self.find(b)
+        if ra == rb:
+            return False
+        if self.r[ra] < self.r[rb]:
+            ra, rb = rb, ra
+        self.p[rb] = ra
+        if self.r[ra] == self.r[rb]:
+            self.r[ra] += 1
+        return True
+
+# 2. Kruskal with early stop for minimax path based on edge weights
+def minimax_path(G: nx.Graph, start, goal, wkey: str = "weight"):
+    if start not in G or goal not in G:
+        raise nx.NodeNotFound("Either source or target is not in G")
+        
+    uf   = UnionFind(G.nodes)
+    adj  = {v: [] for v in G.nodes}          # adjacency in the partial MST
+    edges = sorted(G.edges(data=True), key=lambda e: e[2].get(wkey, float('inf'))) # Use get with default
+
+    for u, v, data in edges:
+        # Check if weight exists, otherwise skip or handle as needed
+        if wkey not in data:
+            # print(f"Warning: Edge ({u}, {v}) missing weight attribute '{wkey}'. Skipping.")
+            continue # Or assign a default weight like float('inf')?
+            
+        if uf.find(u) != uf.find(v): # Only add edge to adj if it connects components
+            uf.union(u, v)
+            adj[u].append(v)
+            adj[v].append(u)
+
+        # once the components touch, we have the minimax bottleneck
+        if uf.find(start) == uf.find(goal):
+            bottleneck = data[wkey]
+            path = _restore_path(adj, start, goal)
+            if path: # Ensure path was actually found
+                return path, bottleneck
+            else: # Should not happen if find(start)==find(goal) but safety check
+                 break # Exit loop, path not found via BFS for some reason
+
+    raise nx.NetworkXNoPath(f"No path found between {start} and {goal}")
+
+
+def _restore_path(adj, s, t):
+    """BFS in the partial MST to get the actual path."""
+    q, prev = deque([s]), {s: None}
+    visited = {s} # Keep track of visited nodes during BFS
+
+    while q:
+        cur = q.popleft()
+        if cur == t: # Found target
+             break
+        
+        # Ensure cur is in adj and adj[cur] is iterable
+        if cur not in adj or not hasattr(adj[cur], '__iter__'):
+             continue # Skip if cur has no neighbors defined in adj
+
+        for nxt in adj[cur]:
+            if nxt not in visited:
+                visited.add(nxt)
+                prev[nxt] = cur
+                q.append(nxt)
+
+    # Reconstruct path
+    path = []
+    curr = t
+    while curr is not None:
+        if curr not in prev and curr != s: # Path broken
+             return None # Indicate path not found
+        path.append(curr)
+        curr = prev.get(curr) # Safely get predecessor
+
+    if not path or path[-1] != s: # Path doesn't reach source
+        return None
+        
+    path.reverse()
+    return path
+
+
+# 3. Minimax barrier based on node energy along the minimax edge-weight path
+def minimax_barrier(G, start, goal, weight="weight", energy="energy"):
+    """
+    Finds the path between start and goal nodes that minimizes the maximum 
+    edge weight (bottleneck) along the path using Kruskal's algorithm (via minimax_path).
+    Then, it returns the maximum node energy encountered along this specific path.
+
+    Args:
+        G (nx.Graph): The graph.
+        start: The starting node.
+        goal: The target node.
+        weight (str): The key for edge weights used in minimax_path.
+        energy (str): The key for node energy attributes.
+
+    Returns:
+        tuple: (max_energy, path) where max_energy is the highest node energy 
+               on the minimax path, and path is the list of nodes in the path.
+        Raises nx.NetworkXNoPath if no path exists.
+        Raises nx.NodeNotFound if start or goal node doesn't exist.
+        Raises KeyError if nodes on the path lack the specified energy attribute.
+    """
+    try:
+        path, bottleneck = minimax_path(G, start, goal, weight)
+        
+        # Check if path is valid before calculating max energy
+        if not path:
+             raise nx.NetworkXNoPath(f"Path reconstruction failed between {start} and {goal}")
+
+        max_energy = -float('inf')
+        for n in path:
+             if n not in G.nodes:
+                  raise nx.NodeNotFound(f"Node {n} from path not found in graph G")
+             if energy not in G.nodes[n]:
+                  raise KeyError(f"Node {n} does not have energy attribute '{energy}'")
+             max_energy = max(max_energy, G.nodes[n][energy])
+             
+        return max_energy, path
+        
+    except nx.NetworkXNoPath:
+         print(f"No path could be found between {start} and {goal}.")
+         raise # Re-raise the exception
+    except nx.NodeNotFound as e:
+         print(f"Error: {e}")
+         raise
+    except KeyError as e:
+         print(f"Error calculating barrier: {e}")
+         raise
+
+
+# --- End: Minimax Pathfinding Code ---
 
 
 def listpath():
@@ -461,72 +617,102 @@ def listpath():
     # Load the pallas.json database
     db = ase.db.connect('pallas.json')
     
-    start = 1
-    end = 11
+    # Define start and end nodes (Assuming these are IDs in the graph/db)
+    start_node = 1  # Example start node ID
+    end_node = 11   # Example end node ID
     
-    # Find all paths between the two minima
-    paths = find_path(G, start, end)
-    
-    if paths:
-        print(f"Found {len(paths)} paths between {start} and {end}:")
-        for i, path in enumerate(paths, 1):
-            minimax_cost = max(G.nodes[node]['e'] for node in path)
-            print(f"\nPath {i}: Minimax cost = {minimax_cost:.4f}, Length = {len(path)}")
+    paths = [] # Initialize paths to empty list
+    try:
+        # Find the path with the minimum barrier using node energy 'e'
+        barrier, path = minimax_barrier(G, start_node, end_node, weight='weight', energy='e')
+        
+        print(f"\nFound minimax barrier path between {start_node} and {end_node}:")
+        print(f"  Barrier Energy = {barrier:.4f}")
+        print(f"  Path Length = {len(path)}")
+        print(f"  Path Nodes = {path}")
+
+        paths = [path] # Store the single best path found
+
+        # Create a folder for this path
+        path_folder = f"minimax_barrier_path_{start_node}_to_{end_node}"
+        os.makedirs(path_folder, exist_ok=True)
             
-            # Create a folder for this path
-            path_folder = f"path_{i}"
-            os.makedirs(path_folder, exist_ok=True)
-            
-            for node in path:
-                node_data = G.nodes[node]
-                node_type = 'Minimum' if node_data['xname'].startswith('M') else 'Saddle'
-                print(f"  Node {node} ({node_type}): Energy = {node_data['e']:.4f}, Volume = {node_data['volume']:.4f}")
-                
-                # Get the structure from the database
-                structure_data = db.get_atoms(node)
-                if structure_data:
-                    write(os.path.join(path_folder, f"{node}_POSCAR"), structure_data, format='vasp', direct=True)
-                else:
-                    print(f"    Warning: Structure data not found for node {node}")
-
-    else:
-        print(f"No paths found between {start} and {end}.")
-    
-    types = np.array([1,1,1,1,2,2,2,2])
-    ntyp = 2
+        # Process the nodes in the found path
+        for node in path:
+            if node in G.nodes:
+                 node_data = G.nodes[node]
+                 node_type = 'Minimum' if node_data.get('xname', '').startswith('M') else 'Saddle'
+                 print(f"    Node {node} ({node_type}): Energy = {node_data.get('e', float('nan')):.4f}, Volume = {node_data.get('volume', float('nan')):.4f}")
+                 
+                 # Get the structure from the database
+                 try:
+                      structure_data = db.get_atoms(id=int(node)) # Ensure node is int for db query
+                      if structure_data:
+                           write(os.path.join(path_folder, f"{node}_POSCAR"), structure_data, format='vasp', direct=True)
+                      else:
+                           print(f"      Warning: Structure data not found in db for node {node}")
+                 except Exception as e:
+                      print(f"      Warning: Error retrieving structure for node {node} from db: {e}")
+            else:
+                 print(f"    Warning: Node {node} from path not found in graph G.")
 
 
+    except (nx.NetworkXNoPath, nx.NodeNotFound, KeyError) as e:
+        print(f"Could not find minimax barrier path between {start_node} and {end_node}: {e}")
 
-
-    # Create a directory to store all path files
-    os.makedirs("path_energies", exist_ok=True)
-
-    for i, path in enumerate(paths, 1):
-        filename = f"path_energies/path_{i}_energy.txt"
+    # --- Energy Profile Plotting (using the single best path) ---
+    if paths: # If a path was successfully found
+        types = np.array([1,1,1,1,2,2,2,2]) # TODO: Get types dynamically if needed
+        ntyp = 2                            # TODO: Get ntyp dynamically if needed
+        
+        os.makedirs("path_energies", exist_ok=True)
+        
+        path = paths[0] # Get the single best path
+        filename = f"path_energies/minimax_barrier_path_{start_node}_to_{end_node}_energy.txt"
         with open(filename, 'w') as f:
-            f.write(f"#Path {i}\n")
-            f.write("#FP_Distance Energy\n")
+            f.write(f"#Minimax Barrier Path: {path}\n")
+            f.write(f"#Barrier Energy: {barrier:.6f}\n")
+            f.write("#Cumulative_FP_Distance Energy\n")
             
             cumulative_distance = 0.0
             for j, node in enumerate(path):
-                node_data = G.nodes[node]
-                energy = node_data['e']
-                
-                if j == 0:
-                    f.write(f"{cumulative_distance:.6f} {energy:.6f}\n")
-                else:
-                    prev_node = path[j-1]
-                    prev_fp = db.get(id=prev_node).data['fp']
-                    curr_fp = db.get(id=node).data['fp']
-                    fp_dist = fplib2.get_fpdist(ntyp, types, prev_fp, curr_fp)
-                    cumulative_distance += fp_dist
-                    f.write(f"{cumulative_distance:.6f} {energy:.6f}\n")
+                try:
+                    node_data = G.nodes[node]
+                    energy = node_data['e']
+                    
+                    if j == 0:
+                        f.write(f"{cumulative_distance:.6f} {energy:.6f}\n")
+                        print(f"  Plot Point {j}: Dist=0.0, Energy={energy:.4f}")
+                    else:
+                        prev_node = path[j-1]
+                        
+                        # Safely get fingerprints from db
+                        try:
+                             prev_fp = db.get(id=int(prev_node)).data['fp']
+                             curr_fp = db.get(id=int(node)).data['fp']
+                             fp_dist = fplib2.get_fpdist(ntyp, types, prev_fp, curr_fp)
+                             cumulative_distance += fp_dist
+                             f.write(f"{cumulative_distance:.6f} {energy:.6f}\n")
+                             print(f"  Plot Point {j}: Dist={cumulative_distance:.4f}, Energy={energy:.4f}")
+                        except Exception as db_err:
+                             print(f"    Warning: Could not get FP data for edge ({prev_node}, {node}) from db: {db_err}. Skipping distance calculation for this step.")
+                             # Optionally write with NaN or previous distance if needed
+                             f.write(f"{cumulative_distance:.6f} {energy:.6f} # FP Distance calculation failed\n")
 
-    print("Energy profiles for all paths have been written to separate files in the 'path_energies' directory.")
-    # with open('pathenergy.txt', 'w') as f:
-    #     for i, path in enumerate(paths, 1):
+
+                except Exception as node_err:
+                     print(f"    Warning: Error processing node {node} for energy profile: {node_err}")
+
+        print(f"\nEnergy profile for the minimax barrier path written to '{filename}'")
+
+    # (Keep plotting code for multiple paths commented out for now)
+    # # Create a directory to store all path files
+    # os.makedirs("path_energies", exist_ok=True)
+    # for i, path in enumerate(paths, 1):
+    #     filename = f"path_energies/path_{i}_energy.txt"
+    #     with open(filename, 'w') as f:
     #         f.write(f"#Path {i}\n")
-    #         f.write("#FP_Distance_Energy\n")
+    #         f.write("#FP_Distance Energy\n")
             
     #         cumulative_distance = 0.0
     #         for j, node in enumerate(path):
@@ -540,13 +726,9 @@ def listpath():
     #                 prev_fp = db.get(id=prev_node).data['fp']
     #                 curr_fp = db.get(id=node).data['fp']
     #                 fp_dist = fplib2.get_fpdist(ntyp, types, prev_fp, curr_fp)
-
     #                 cumulative_distance += fp_dist
     #                 f.write(f"{cumulative_distance:.6f} {energy:.6f}\n")
-            
-    #         f.write("\n")  # Add a blank line between paths
-    
-    # print("Energy profiles for all paths have been written to pathenergy.txt")
+    # print("Energy profiles for all paths have been written to separate files in the 'path_energies' directory.")
 
 def test():
     pp0 = read('POSCAR', format='vasp')
