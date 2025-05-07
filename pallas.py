@@ -33,6 +33,7 @@ class Pallas(object):
         self.lmax = 0
         self.natx = 200
         self.ntyp = 2
+        self.znucl = [48, 34]
         self.types = np.array([1,1,1,1,2,2,2,2])
         self.dij = np.zeros((10000, 10000), float)
         self.baseenergy = 0.0
@@ -62,7 +63,7 @@ class Pallas(object):
             raise ValueError("At least two structures (reactant and product) are required for PSO")
             
         self.db = ase.db.connect('pallas.db')
-        self.dij[:][:] = 1000.
+        self.dij[:][:] = float('inf')
         np.fill_diagonal(self.dij, 0.0)
         
         self.init_minima = self.read_init_structure(flist)
@@ -107,12 +108,12 @@ class Pallas(object):
         print("Optimizing reactant structure")
         react_opt = local_optimization(self.reactant)
         # print (react_opt.calc)
-        react_id, isnew = self.update_minima(react_opt)
+        react_id, _ = self.update_minima(react_opt)
         react_opt.id = react_id
         
         print("Optimizing product structure")
         prod_opt = local_optimization(self.product)
-        prod_id, isnew = self.update_minima(prod_opt)
+        prod_id, _ = self.update_minima(prod_opt)
         prod_opt.id = prod_id
         
         # Set base energy to reactant energy
@@ -176,40 +177,42 @@ class Pallas(object):
                 print(f"Processing particle {i+1}/{self.popsize}")
                 
                 # Calculate saddle point from reactant side
-                try:
-                    reactant_saddle = self.calculate_saddle_with_velocity(
-                        reactant_particles[i], 
-                        reactant_velocities[i]
-                    )
-                    reactant_saddles.append(reactant_saddle)
-                    
-                    # Update the saddle in database and graph
-                    sadr_id, isnew = self.update_saddle(reactant_saddle)
-                    reactant_saddle.id = sadr_id
-                    h = reactant_saddle.get_volume()*self.press*GPa + reactant_saddle.get_potential_energy() - self.baseenergy
-                    volume = reactant_saddle.get_volume()
-                    
-                    # Add node and edge to graph
-                    self.G.add_node(sadr_id, xname=f'S{sadr_id}', e=h, volume=volume)
-                    self.G.add_edge(react_id, sadr_id)
-                    print(f"Added saddle from reactant: ID={sadr_id}, Energy={h:.4f}")
-                    
-                    # Find local minimum from this saddle
-                    new_min_r = local_optimization(reactant_saddle)
-                    min_r_id, isnew = self.update_minima(new_min_r)
-                    new_min_r.id = min_r_id
-                    h = new_min_r.get_volume()*self.press/1602.176487 + new_min_r.get_potential_energy() - self.baseenergy
-                    volume = new_min_r.get_volume()
-                    
-                    # Update graph with new minimum
-                    self.G.add_node(min_r_id, xname=f'M{min_r_id}', e=h, volume=volume)
-                    self.G.add_edge(sadr_id, min_r_id)
-                    print(f"Added minimum from reactant saddle: ID={min_r_id}, Energy={h:.4f}")
-                    
-                    # Update particle position
-                    reactant_particles[i] = cp(new_min_r)
-                except Exception as e:
-                    print(f"Error calculating reactant saddle for particle {i}: {e}")
+                # try:
+                reactant_saddle = self.calculate_saddle_with_velocity(
+                    reactant_particles[i], 
+                    reactant_velocities[i]
+                )
+                reactant_saddles.append(reactant_saddle)
+                
+                # Update the saddle in database and graph
+                sadr_id, _ = self.update_saddle(reactant_saddle)
+                reactant_saddle.id = sadr_id
+                h = reactant_saddle.get_volume()*self.press*GPa + reactant_saddle.get_potential_energy() - self.baseenergy
+                volume = reactant_saddle.get_volume()
+                
+                # Add node and edge to graph
+                self.G.add_node(sadr_id, xname=f'S{sadr_id}', e=h, volume=volume)
+                self.G.add_edge(react_id, sadr_id)
+                print(f"Added saddle from reactant: ID={sadr_id}, Energy={h:.4f}")
+                
+                # Find local minimum from this saddle
+                sadxcal = self.xcal(reactant_saddle, prod_opt.get_fp())
+                new_min_r = local_optimization(sadxcal)
+                min_r_id, _ = self.update_minima(new_min_r)
+                new_min_r.id = min_r_id
+                h = new_min_r.get_volume()*self.press*GPa + new_min_r.get_potential_energy() - self.baseenergy
+                volume = new_min_r.get_volume()
+                
+                # Update graph with new minimum
+                self.G.add_node(min_r_id, xname=f'M{min_r_id}', e=h, volume=volume)
+                self.G.add_edge(sadr_id, min_r_id)
+                print(f"Added minimum from reactant saddle: ID={min_r_id}, Energy={h:.4f}")
+                
+                # Update particle position
+                reactant_particles[i] = cp(new_min_r)
+
+                # except Exception as e:
+                #     print(f"Error calculating reactant saddle for particle {i}: {e}")
                 
                 # Calculate saddle point from product side
                 try:
@@ -220,9 +223,9 @@ class Pallas(object):
                     product_saddles.append(product_saddle)
                     
                     # Update the saddle in database and graph
-                    sadp_id, isnew = self.update_saddle(product_saddle)
+                    sadp_id, _ = self.update_saddle(product_saddle)
                     product_saddle.id = sadp_id
-                    h = product_saddle.get_volume()*self.press/1602.176487 + product_saddle.get_potential_energy() - self.baseenergy
+                    h = product_saddle.get_volume()*self.press*GPa + product_saddle.get_potential_energy() - self.baseenergy
                     volume = product_saddle.get_volume()
                     
                     # Add node and edge to graph
@@ -231,10 +234,11 @@ class Pallas(object):
                     print(f"Added saddle from product: ID={sadp_id}, Energy={h:.4f}")
                     
                     # Find local minimum from this saddle
-                    new_min_p = local_optimization(product_saddle)
-                    min_p_id, isnew = self.update_minima(new_min_p)
+                    sadxcal = self.xcal(product_saddle, react_opt.get_fp())
+                    new_min_p = local_optimization(sadxcal)
+                    min_p_id, _ = self.update_minima(new_min_p)
                     new_min_p.id = min_p_id
-                    h = new_min_p.get_volume()*self.press/1602.176487 + new_min_p.get_potential_energy() - self.baseenergy
+                    h = new_min_p.get_volume()*self.press*GPa + new_min_p.get_potential_energy() - self.baseenergy
                     volume = new_min_p.get_volume()
                     
                     # Update graph with new minimum
@@ -443,110 +447,110 @@ class Pallas(object):
         velocity = vunit(velocity)
         return velocity
         
-    def run(self):
-        """Original run method - kept for backward compatibility."""
-        xlist = []
+    # def run(self):
+    #     """Original run method - kept for backward compatibility."""
+    #     xlist = []
 
-        # Iterate through initial minima
-        for i in range(self.num_init_min):
-            # Optimize the initial structure
-            optx = local_optimization(self.init_minima[i])
-            # Update minima and get new ID
-            idm, isnew = self.update_minima(optx)
-            optx.id = idm
+    #     # Iterate through initial minima
+    #     for i in range(self.num_init_min):
+    #         # Optimize the initial structure
+    #         optx = local_optimization(self.init_minima[i])
+    #         # Update minima and get new ID
+    #         idm, isnew = self.update_minima(optx)
+    #         optx.id = idm
             
-            # Calculate energy (h) relative to base energy
-            if i == 0:
-                # Set base energy for the first minimum
-                self.baseenergy = optx.get_volume()*self.press/1602.176487 + optx.get_potential_energy()
-                h = 0.0
-            else:
-                # Calculate relative energy for subsequent minima
-                h = optx.get_volume()*self.press/1602.176487 + optx.get_potential_energy() - self.baseenergy
+    #         # Calculate energy (h) relative to base energy
+    #         if i == 0:
+    #             # Set base energy for the first minimum
+    #             self.baseenergy = optx.get_volume()*self.press/1602.176487 + optx.get_potential_energy()
+    #             h = 0.0
+    #         else:
+    #             # Calculate relative energy for subsequent minima
+    #             h = optx.get_volume()*self.press/1602.176487 + optx.get_potential_energy() - self.baseenergy
             
-            # Get volume of the optimized structure
-            volume = optx.get_volume()
+    #         # Get volume of the optimized structure
+    #         volume = optx.get_volume()
             
-            # Add node to the graph
-            self.G.add_node(idm, xname='M'+str(idm), e=h, volume=volume)
+    #         # Add node to the graph
+    #         self.G.add_node(idm, xname='M'+str(idm), e=h, volume=volume)
             
-            # Print information about the added node
-            print(f"Added node: ID={idm}, Type=Minimum, Energy={h:.4f}, Volume={volume:.4f}")
+    #         # Print information about the added node
+    #         print(f"Added node: ID={idm}, Type=Minimum, Energy={h:.4f}, Volume={volume:.4f}")
             
-            # Save the updated graph
-            self.save_graph()  
+    #         # Save the updated graph
+    #         self.save_graph()  
 
-            # For each initial minimum, perform popsize number of saddle point optimizations
-            for ip in range(self.popsize):
-                try:
-                    sadx = cal_saddle(optx)
-                except:
-                    print(f"Failed to calculate saddle for Minimum {optx.id}")
-                    continue
-                if sadx.converged:
-                    ids, isnew = self.update_saddle(sadx)
-                    sadx.id = ids
-                    h = sadx.get_volume()*self.press/1602.176487 + sadx.get_potential_energy() - self.baseenergy
-                    volume = sadx.get_volume()
-                    self.G.add_node(ids, xname='S'+str(ids), e=h, volume=volume)
-                    self.G.add_edge(idm, ids)
-                    print(f"Added node: ID={ids}, Type=Saddle, Energy={h:.4f}, Volume={volume:.4f}")
-                    print(f"Added edge: Minimum {idm} -> Saddle {ids}")
-                    self.save_graph()
-                    xlist.append(cp(sadx))
+    #         # For each initial minimum, perform popsize number of saddle point optimizations
+    #         for ip in range(self.popsize):
+    #             try:
+    #                 sadx = cal_saddle(optx)
+    #             except:
+    #                 print(f"Failed to calculate saddle for Minimum {optx.id}")
+    #                 continue
+    #             if sadx.converged:
+    #                 ids, isnew = self.update_saddle(sadx)
+    #                 sadx.id = ids
+    #                 h = sadx.get_volume()*self.press/1602.176487 + sadx.get_potential_energy() - self.baseenergy
+    #                 volume = sadx.get_volume()
+    #                 self.G.add_node(ids, xname='S'+str(ids), e=h, volume=volume)
+    #                 self.G.add_edge(idm, ids)
+    #                 print(f"Added node: ID={ids}, Type=Saddle, Energy={h:.4f}, Volume={volume:.4f}")
+    #                 print(f"Added edge: Minimum {idm} -> Saddle {ids}")
+    #                 self.save_graph()
+    #                 xlist.append(cp(sadx))
 
-        # Iterate until reaching maxstep
-        for istep in range(self.maxstep):
-            print(f'Step: {istep + 1}')
-            new_xlist = []
+    #     # Iterate until reaching maxstep
+    #     for istep in range(self.maxstep):
+    #         print(f'Step: {istep + 1}')
+    #         new_xlist = []
 
-            # Process each saddle point
-            for saddle in xlist:
-                # Generate one local minimum from each saddle point
-                try:
-                    new_min = local_optimization(saddle)
-                except:
-                    print(f"Failed to optimize from Saddle {saddle.id}")
-                    continue
+    #         # Process each saddle point
+    #         for saddle in xlist:
+    #             # Generate one local minimum from each saddle point
+    #             try:
+    #                 new_min = local_optimization(saddle)
+    #             except:
+    #                 print(f"Failed to optimize from Saddle {saddle.id}")
+    #                 continue
 
-                if new_min.converged:
-                    idm, isnew = self.update_minima(new_min)
-                    new_min.id = idm
-                    h = new_min.get_volume()*self.press/1602.176487 + new_min.get_potential_energy() - self.baseenergy
-                    volume = new_min.get_volume()
-                    self.G.add_node(idm, xname=f'M{idm}', e=h, volume=volume)
-                    self.G.add_edge(saddle.id, idm)
-                    print(f"Added node: ID={idm}, Type=Minimum, Energy={h:.4f}, Volume={volume:.4f}")
-                    print(f"Added edge: Saddle {saddle.id} -> Minimum {idm}")
-                    self.save_graph()
+    #             if new_min.converged:
+    #                 idm, isnew = self.update_minima(new_min)
+    #                 new_min.id = idm
+    #                 h = new_min.get_volume()*self.press/1602.176487 + new_min.get_potential_energy() - self.baseenergy
+    #                 volume = new_min.get_volume()
+    #                 self.G.add_node(idm, xname=f'M{idm}', e=h, volume=volume)
+    #                 self.G.add_edge(saddle.id, idm)
+    #                 print(f"Added node: ID={idm}, Type=Minimum, Energy={h:.4f}, Volume={volume:.4f}")
+    #                 print(f"Added edge: Saddle {saddle.id} -> Minimum {idm}")
+    #                 self.save_graph()
 
-                    # Generate one saddle point from the new minimum
-                    try:
-                        new_saddle = cal_saddle(new_min)
-                    except:
-                        print(f"Failed to calculate saddle for Minimum {new_min.id}")
-                        continue
+    #                 # Generate one saddle point from the new minimum
+    #                 try:
+    #                     new_saddle = cal_saddle(new_min)
+    #                 except:
+    #                     print(f"Failed to calculate saddle for Minimum {new_min.id}")
+    #                     continue
 
-                    if new_saddle.converged:
-                        ids, isnew = self.update_saddle(new_saddle)
-                        new_saddle.id = ids
-                        h = new_saddle.get_volume()*self.press/1602.176487 + new_saddle.get_potential_energy() - self.baseenergy
-                        volume = new_saddle.get_volume()
-                        self.G.add_node(ids, xname=f'S{ids}', e=h, volume=volume)
-                        self.G.add_edge(idm, ids)
-                        print(f"Added node: ID={ids}, Type=Saddle, Energy={h:.4f}, Volume={volume:.4f}")
-                        print(f"Added edge: Minimum {idm} -> Saddle {ids}")
-                        self.save_graph()
-                        new_xlist.append(cp(new_saddle))
+    #                 if new_saddle.converged:
+    #                     ids, isnew = self.update_saddle(new_saddle)
+    #                     new_saddle.id = ids
+    #                     h = new_saddle.get_volume()*self.press/1602.176487 + new_saddle.get_potential_energy() - self.baseenergy
+    #                     volume = new_saddle.get_volume()
+    #                     self.G.add_node(ids, xname=f'S{ids}', e=h, volume=volume)
+    #                     self.G.add_edge(idm, ids)
+    #                     print(f"Added node: ID={ids}, Type=Saddle, Energy={h:.4f}, Volume={volume:.4f}")
+    #                     print(f"Added edge: Minimum {idm} -> Saddle {ids}")
+    #                     self.save_graph()
+    #                     new_xlist.append(cp(new_saddle))
 
-            # Update xlist for the next iteration
-            xlist = cp(new_xlist)
+    #         # Update xlist for the next iteration
+    #         xlist = cp(new_xlist)
 
-            if not xlist:
-                print("No new structures generated. Stopping the iteration.")
-                break
+    #         if not xlist:
+    #             print("No new structures generated. Stopping the iteration.")
+    #             break
 
-            self.save_graph()
+    #         self.save_graph()
     
     def save_graph(self):
         joblib.dump(self.G, 'graph.pkl')
@@ -554,20 +558,30 @@ class Pallas(object):
         nx.write_gexf(self.G, 'graph.gexf')
         joblib.dump(self.dij, 'dij.pkl')       
 
-    def add_perturbation(self, structure):
-        # calc = XCalculator(
-        #     fp0 = fp0,
-        #     cutoff = self.fpcutoff,
-        #     contract=False, 
-        #     lmax = self.lmax,
-        #     nx=self.natx,
-        #     ntyp=self.ntyp)
-        # atoms = cp(structure)
+    def xcal(self, structure, fp0):
+        atoms = cp(structure)
+        # znucl = atoms.get_atomic_numbers()
+        # znucl = np.array(znucl)
+        # print (znucl)
+        calc = XCalculator(
+            parallel=False,
+            atoms = atoms,
+            znucl = self.znucl,
+            fp0 = fp0,
+            cutoff = self.fpcutoff,
+            contract=False, 
+            lmax = self.lmax,
+            nx=self.natx,
+            ntyp=self.ntyp)
         
-        # af = UnitCellFilter(atoms)
-        # opt = FIRE(af, maxstep=0.1)
-        # opt.run(fmax=0.01, steps=20)
-        # return atoms
+        atoms.calc = calc
+        af = UnitCellFilter(atoms)
+        opt = FIRE(af, maxstep=0.1, logfile='xcal.log')
+        opt.run(fmax=0.01, steps=60)
+        return atoms
+
+    def add_perturbation(self, structure):
+
         
         # """Add a small random perturbation to atomic positions."""
         atoms = cp(structure)
@@ -693,7 +707,8 @@ class PallasAtom(Atoms):
         lat = self.get_cell()
         rxyz = self.get_positions()
         types = np.array([1,1,1,1,2,2,2,2])
-        znucl = self.get_atomic_numbers()
+        # znucl = self.get_atomic_numbers()
+        znucl = self.znucl = [48, 34]
         ntyp = 2
         fp = fplib2.get_fp(False, ntyp, self.natx, self.lmax, lat, rxyz, types, znucl, self.fpcutoff)
         self.fp = fp

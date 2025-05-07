@@ -1,4 +1,4 @@
-import ssdimer
+from dimer import SolidStateDimer
 from util import vunit, vrand
 from ase.io import read, write
 import os
@@ -28,11 +28,12 @@ calc = MatterSimCalculator(device=device)
 
 
 def local_optimization(patoms):
-    atoms = cp(patoms)
+    # atoms = cp(patoms)
+    atoms=patoms
     atoms.calc = calc
     ecf = ExpCellFilter(atoms)
-    opt = BFGS(ecf, logfile='opt.log')
-    opt.run(fmax=0.001, steps=1000)
+    opt = FIRE(ecf, maxstep=0.1, logfile='opt.log')
+    opt.run(fmax=0.001, steps=2000)
     fmax = np.max(np.abs(ecf.get_forces()))
     if fmax > 0.001:
         print("Warning: fmax = ", fmax)
@@ -75,11 +76,11 @@ def cal_saddle(patoms):
     atoms.set_positions(atoms.get_positions() + mode[:-3])
 
     # set a ssdimer_atoms object
-    d = ssdimer.SSDimer_atoms(atoms, mode = mode, ss=True, rotationMax = 4, phi_tol=15)
+    d = SolidStateDimer(atoms, mode = mode)
 
     # use FIRE optimizer in ase
-    dyn = FIRE(d, logfile='ssdimer.log')
-    dyn.run(fmax=0.01, steps=1000)
+    dyn = FIRE(d, maxstep=0.1, logfile='ssdimer.log')
+    dyn.run(fmax=0.01, steps=2000)
     fmax = np.max(np.abs(atoms.get_forces()))
     if fmax > 0.01:
         print("Warning: fmax = ", fmax)
@@ -110,10 +111,6 @@ def getx(cell1, cell2):
     return mode
 
 def lower_triangular_cell(atoms):
-    """
-    Return a copy of `atoms` whose cell has zeros above the diagonal
-    and write it to `out_file` (VASP / POSCAR) if a name is given.
-    """
     old_cell = atoms.cell.array          # 3×3 matrix, row vectors a1,a2,a3
     a1 = old_cell[0]
 
@@ -140,11 +137,5 @@ def lower_triangular_cell(atoms):
                          [bx, by,  0.0],
                          [cx, cy,  cz ]])
 
-    # --- transform atomic positions --------------------------------------
-    # cart = atoms.get_positions()                         # N×3 Cartesian
-    # frac = np.linalg.solve(new_cell.T, cart.T).T         # → fractional in new cell
-
-    # new_atoms = atoms.copy()
-    # new_atoms.set_cell(new_cell, scale_atoms=True)
 
     return new_cell
