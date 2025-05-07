@@ -8,7 +8,6 @@ from ase.io import read, write
 import ase.db
 import networkx as nx
 import joblib
-from util import vunit, vrand
 import random
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
@@ -21,7 +20,7 @@ from ase.constraints import StrainFilter, UnitCellFilter
 
 from xcal import XCalculator
 
-from zfunc import local_optimization, cal_saddle
+from zfunc import local_optimization, cal_saddle, vunit, vrand
 
 class Pallas(object):
     def __init__(self):
