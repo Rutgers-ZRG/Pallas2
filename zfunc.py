@@ -1,25 +1,25 @@
 from dimer import SolidStateDimer
-from util import vunit, vrand
-from ase.io import read, write
+# Removing util import and adding vector utility functions directly
 import os
 import sys
 import numpy as np
 
 import pickle
-import numpy as np
-#from nequip.ase.nequip_calculator import nequip_calculator
 from ase.io import read, write, Trajectory
 from ase.optimize import FIRE, BFGS
-# from ase.constraints import ExpCellFilter
 from ase.filters import ExpCellFilter
-#from custom_calc_mixed import Custom_Nequip_Calc
 from copy import deepcopy as cp
 
 
-#nequip_ef_path = "model/cdse_energy_force_model.pth"
-#nequip_s_path = "model/cdse_stress_model.pth"
-#
-#calc  = Custom_Nequip_Calc(nequip_ef_calc_path=nequip_ef_path, nequip_s_calc_path=nequip_s_path)
+def vunit(v):
+    mag = np.sqrt(np.vdot(v, v))
+    if mag == 0:
+        return v
+    return v / mag
+
+def vrand(v):
+    vtemp = np.random.randn(v.size)
+    return vtemp.reshape(v.shape)
 
 from mattersim.forcefield import MatterSimCalculator
 
