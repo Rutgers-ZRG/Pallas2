@@ -286,7 +286,7 @@ def get_fpdist(ntyp, types, fp1, fp2, mx=False):
     row_ind, col_ind = linear_sum_assignment(MX)
     # print(row_ind, col_ind)
     total = MX[row_ind, col_ind].sum()
-    print (total)
+    # print (total)
     fpd += total
 
     fpd = fpd / nat
