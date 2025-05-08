@@ -11,12 +11,13 @@ import joblib
 import random
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
-import fplib2
+import libfp
 import time
 from ase.units import GPa
 
 from ase.optimize import FIRE
-from ase.constraints import StrainFilter, UnitCellFilter
+# from ase.constraints import StrainFilter, UnitCellFilter
+from ase.filters import FrechetCellFilter
 
 from xcal import XCalculator
 
@@ -31,9 +32,9 @@ class Pallas(object):
         self.fpcutoff = 5.5
         self.lmax = 0
         self.natx = 200
-        self.ntyp = 2
-        self.znucl = [48, 34]
-        self.types = np.array([1,1,1,1,2,2,2,2])
+        self.ntyp = None
+        self.znucl = None
+        self.types = None # np.array([1,1,1,1,2,2,2,2])
         self.dij = np.zeros((10000, 10000), float)
         self.baseenergy = 0.0
         self.G = nx.Graph()
@@ -54,7 +55,7 @@ class Pallas(object):
         self.dist_threshold = 0.01
         self.velocity_weight = 0.9
         self.c1 = 2.0  # Personal best weight
-        self.c2 = 2.0  # Global best weight
+        self.c2 = 1.5  # Global best weight
         
 
     def init_run(self, flist):
@@ -65,18 +66,35 @@ class Pallas(object):
         self.dij[:][:] = float('inf')
         np.fill_diagonal(self.dij, 0.0)
         
+        # Ensure types and znucl are set properly before we create PallasAtom objects
+        if self.types is None:
+            print("Warning: self.types is None in init_run! This will cause segfaults.")
+        
+        if self.znucl is None:
+            print("Warning: self.znucl is empty in init_run! This may cause problems.")
+        
         self.init_minima = self.read_init_structure(flist)
         self.num_init_min = len(self.init_minima)
-        
+
+
         # Use the first structure as reactant and the second as product
         self.reactant = self.init_minima[0]
         self.product = self.init_minima[1]
+        
+        # Double-check the types are set properly
+        for struct in self.init_minima:
+            if struct.types is None:
+                print(f"Warning: types not properly set in structure after initialization")
+                struct.types = self.types
 
     def read_init_structure(self, flist):
         init_minima = []
         for xf in flist:
             x = read(xf, format='vasp')
             x = PallasAtom(x)
+            x.fpcutoff = self.fpcutoff
+            x.types = self.types
+            x.znucl = self.znucl
             init_minima.append(cp(x))
         return init_minima
     
@@ -191,7 +209,21 @@ class Pallas(object):
                 
                 # Add node and edge to graph
                 self.G.add_node(sadr_id, xname=f'S{sadr_id}', e=h, volume=volume)
-                self.G.add_edge(react_id, sadr_id)
+                # Calculate edge weight (max energy) and add with fingerprint distance
+                react_energy = self.G.nodes[react_id]['e']
+                edge_weight = max(react_energy, h)
+                # Use previous fingerprint distance calculation or calculate new one
+                fp_r = react_opt.get_fp()
+                fp_s = reactant_saddle.get_fp()
+                if self.types is not None:
+                    try:
+                        fp_dist = libfp.get_fp_dist(fp_r, fp_s, self.types)
+                    except Exception as e:
+                        print(f"Error calculating fp_dist for edge: {e}")
+                        fp_dist = float('inf')
+                else:
+                    fp_dist = float('inf')
+                self.G.add_edge(react_id, sadr_id, weight=edge_weight, dist=fp_dist)
                 print(f"Added saddle from reactant: ID={sadr_id}, Energy={h:.4f}")
                 
                 # Find local minimum from this saddle
@@ -204,7 +236,21 @@ class Pallas(object):
                 
                 # Update graph with new minimum
                 self.G.add_node(min_r_id, xname=f'M{min_r_id}', e=h, volume=volume)
-                self.G.add_edge(sadr_id, min_r_id)
+                # Calculate edge weight and add with fingerprint distance
+                saddle_energy = self.G.nodes[sadr_id]['e']
+                edge_weight = max(saddle_energy, h)
+                # Use previous fingerprint distance calculation or calculate new one
+                fp_s = reactant_saddle.get_fp()
+                fp_m = new_min_r.get_fp()
+                if self.types is not None:
+                    try:
+                        fp_dist = libfp.get_fp_dist(fp_s, fp_m, self.types)
+                    except Exception as e:
+                        print(f"Error calculating fp_dist for edge: {e}")
+                        fp_dist = float('inf')
+                else:
+                    fp_dist = float('inf')
+                self.G.add_edge(sadr_id, min_r_id, weight=edge_weight, dist=fp_dist)
                 print(f"Added minimum from reactant saddle: ID={min_r_id}, Energy={h:.4f}")
                 
                 # Update particle position
@@ -229,7 +275,21 @@ class Pallas(object):
                     
                     # Add node and edge to graph
                     self.G.add_node(sadp_id, xname=f'S{sadp_id}', e=h, volume=volume)
-                    self.G.add_edge(prod_id, sadp_id)
+                    # Calculate edge weight (max energy) and add with fingerprint distance
+                    prod_energy = self.G.nodes[prod_id]['e']
+                    edge_weight = max(prod_energy, h)
+                    # Use previous fingerprint distance calculation or calculate new one
+                    fp_p = prod_opt.get_fp()
+                    fp_s = product_saddle.get_fp()
+                    if self.types is not None:
+                        try:
+                            fp_dist = libfp.get_fp_dist(fp_p, fp_s, self.types)
+                        except Exception as e:
+                            print(f"Error calculating fp_dist for edge: {e}")
+                            fp_dist = float('inf')
+                    else:
+                        fp_dist = float('inf')
+                    self.G.add_edge(prod_id, sadp_id, weight=edge_weight, dist=fp_dist)
                     print(f"Added saddle from product: ID={sadp_id}, Energy={h:.4f}")
                     
                     # Find local minimum from this saddle
@@ -242,7 +302,21 @@ class Pallas(object):
                     
                     # Update graph with new minimum
                     self.G.add_node(min_p_id, xname=f'M{min_p_id}', e=h, volume=volume)
-                    self.G.add_edge(sadp_id, min_p_id)
+                    # Calculate edge weight and add with fingerprint distance
+                    saddle_energy = self.G.nodes[sadp_id]['e']
+                    edge_weight = max(saddle_energy, h)
+                    # Use previous fingerprint distance calculation or calculate new one
+                    fp_s = product_saddle.get_fp()
+                    fp_m = new_min_p.get_fp()
+                    if self.types is not None:
+                        try:
+                            fp_dist = libfp.get_fp_dist(fp_s, fp_m, self.types)
+                        except Exception as e:
+                            print(f"Error calculating fp_dist for edge: {e}")
+                            fp_dist = float('inf')
+                    else:
+                        fp_dist = float('inf')
+                    self.G.add_edge(sadp_id, min_p_id, weight=edge_weight, dist=fp_dist)
                     print(f"Added minimum from product saddle: ID={min_p_id}, Energy={h:.4f}")
                     
                     # Update particle position
@@ -273,23 +347,38 @@ class Pallas(object):
                     # Calculate fingerprint distance
                     fp_r = min_r.get_fp()
                     fp_p = min_p.get_fp()
-                    fp_dist = fplib2.get_fpdist(self.ntyp, self.types, fp_r, fp_p)
-                    energy_diff = abs(min_r.get_potential_energy() - min_p.get_potential_energy())
                     
-                    # Only print if distance is below a threshold or it meets a significant condition
-                    if fp_dist < 0.1:  # Only print "interesting" distances
-                        print(f"FP distance between minima {min_r.id} and {min_p.id}: {fp_dist:.5f}, energy diff: {energy_diff:.5f}")
-                    
-                    # If distance is below threshold and energy difference is small, add edge
-                    if fp_dist < self.dist_threshold and energy_diff < self.ediff:
-                        print(f"Connection found between minima {min_r.id} and {min_p.id}!")
-                        self.G.add_edge(min_r.id, min_p.id)
-                        connection_found = True
-                    
-                    # Update minimum distance
-                    if fp_dist < min_dist:
-                        min_dist = fp_dist
-                        best_pair = (i, j)
+                    # Make sure types is not None before calling the function
+                    if self.types is None:
+                        print("Warning: self.types is None in fingerprint comparison!")
+                        continue
+                        
+                    try:
+                        # fp_dist = fplib2.get_fpdist(self.ntyp, self.types, fp_r, fp_p)
+                        fp_dist = libfp.get_fp_dist(fp_r, fp_p, self.types)
+                        energy_diff = abs(min_r.get_potential_energy() - min_p.get_potential_energy())
+                        
+                        # Only print if distance is below a threshold or it meets a significant condition
+                        if fp_dist < 0.1:  # Only print "interesting" distances
+                            print(f"FP distance between minima {min_r.id} and {min_p.id}: {fp_dist:.5f}, energy diff: {energy_diff:.5f}")
+                        
+                        # If distance is below threshold and energy difference is small, add edge
+                        if fp_dist < self.dist_threshold and energy_diff < self.ediff:
+                            print(f"Connection found between minima {min_r.id} and {min_p.id}!")
+                            # Calculate edge weight (max energy)
+                            min_r_energy = self.G.nodes[min_r.id]['e'] if min_r.id in self.G.nodes else min_r.get_volume()*self.press*GPa + min_r.get_potential_energy() - self.baseenergy
+                            min_p_energy = self.G.nodes[min_p.id]['e'] if min_p.id in self.G.nodes else min_p.get_volume()*self.press*GPa + min_p.get_potential_energy() - self.baseenergy
+                            edge_weight = max(min_r_energy, min_p_energy)
+                            self.G.add_edge(min_r.id, min_p.id, weight=edge_weight, dist=fp_dist)
+                            connection_found = True
+                        
+                        # Update minimum distance
+                        if fp_dist < min_dist:
+                            min_dist = fp_dist
+                            best_pair = (i, j)
+                    except Exception as e:
+                        print(f"Error calculating distance between minima {min_r.id} and {min_p.id}: {e}")
+                        continue
             
             # Update global best if new minimum distance is found
             if min_dist < self.bestdist:
@@ -305,9 +394,20 @@ class Pallas(object):
                 for min_p in minima_from_product:
                     fp_r = min_r.get_fp()
                     fp_p = min_p.get_fp()
-                    fp_dist = fplib2.get_fpdist(self.ntyp, self.types, fp_r, fp_p)
-                    if fp_dist < best_dist_for_r:
-                        best_dist_for_r = fp_dist
+                    
+                    # Make sure types is not None before calling the function
+                    if self.types is None:
+                        print("Warning: self.types is None in personal best update!")
+                        continue
+                    
+                    try:
+                        # fp_dist = fplib2.get_fpdist(self.ntyp, self.types, fp_r, fp_p)
+                        fp_dist = libfp.get_fp_dist(fp_r, fp_p, self.types)
+                        if fp_dist < best_dist_for_r:
+                            best_dist_for_r = fp_dist
+                    except Exception as e:
+                        print(f"Error calculating distance for personal best update: {e}")
+                        continue
                 
                 # Update personal best if improved
                 if best_dist_for_r < self.pdistx[i]:
@@ -323,9 +423,20 @@ class Pallas(object):
                 for min_r in minima_from_reactant:
                     fp_r = min_r.get_fp()
                     fp_p = min_p.get_fp()
-                    fp_dist = fplib2.get_fpdist(self.ntyp, self.types, fp_r, fp_p)
-                    if fp_dist < best_dist_for_p:
-                        best_dist_for_p = fp_dist
+                    
+                    # Make sure types is not None before calling the function
+                    if self.types is None:
+                        print("Warning: self.types is None in personal best update!")
+                        continue
+                    
+                    try:
+                        # fp_dist = fplib2.get_fpdist(self.ntyp, self.types, fp_r, fp_p)
+                        fp_dist = libfp.get_fp_dist(fp_r, fp_p, self.types)
+                        if fp_dist < best_dist_for_p:
+                            best_dist_for_p = fp_dist
+                    except Exception as e:
+                        print(f"Error calculating distance for personal best update: {e}")
+                        continue
                 
                 # Update personal best if improved
                 if best_dist_for_p < self.pdisty[j]:
@@ -559,9 +670,6 @@ class Pallas(object):
 
     def xcal(self, structure, fp0):
         atoms = cp(structure)
-        # znucl = atoms.get_atomic_numbers()
-        # znucl = np.array(znucl)
-        # print (znucl)
         calc = XCalculator(
             parallel=False,
             atoms = atoms,
@@ -572,9 +680,8 @@ class Pallas(object):
             lmax = self.lmax,
             nx=self.natx,
             ntyp=self.ntyp)
-        
         atoms.calc = calc
-        af = UnitCellFilter(atoms)
+        af = FrechetCellFilter(atoms)
         opt = FIRE(af, maxstep=0.1, logfile='xcal.log')
         opt.run(fmax=0.01, steps=60)
         return atoms
@@ -608,12 +715,14 @@ class Pallas(object):
         print("Energy after perturbation: ", atoms.get_potential_energy())
         return atoms
         
-    def cal_fp(self, minima):
-        lat = minima.get_cell()
-        rxyz = minima.get_positions()
+    def cal_fp(self, structure):
+        lat = structure.cell[:]
+        rxyz = structure.get_positions()
         types = self.types
-        znucl = minima.get_atomic_numbers()
-        fp = fplib2.get_fp(False, self.ntyp, self.natx, self.lmax, lat, rxyz, types, znucl, self.fpcutoff)
+        znucl = self.znucl
+        cell = (lat, rxyz, types, znucl)
+        fp = libfp.get_lfp(cell, cutoff=self.fpcutoff, log=False, natx = self.natx, orbital='s')
+        # fp = fplib2.get_fp(False, self.ntyp, self.natx, self.lmax, lat, rxyz, types, znucl, self.fpcutoff)
         return fp
     
     def update_dij(self, id1, id2, fp_dist):
@@ -632,8 +741,13 @@ class Pallas(object):
         em = minima.get_potential_energy()
         isnew = True
         for x in self.db.select(ctyp='minima'):
-            fpx = x.data['fp']
-            fp_dist = fplib2.get_fpdist(self.ntyp, self.types, fpm, fpx)
+            fpx = np.array(x.data['fp'])
+            # fp_dist = fplib2.get_fpdist(self.ntyp, self.types, fpm, fpx)
+            # Make sure types is not None before calling the function
+            if self.types is None:
+                print("Warning: self.types is None in update_minima!")
+                continue
+            fp_dist = libfp.get_fp_dist(fpm, fpx, self.types)
             ediff = np.abs(em - x.data['energy'])
             if fp_dist < 0.005 and ediff < 0.001:
                 idm = x.id
@@ -645,13 +759,23 @@ class Pallas(object):
         
         for x in self.db.select(ctyp='minima'):
             if x.id != idm:
-                fpx = x.data['fp']
-                fp_dist = fplib2.get_fpdist(self.ntyp, self.types, fpm, fpx)
+                fpx = np.array(x.data['fp'])
+                # fp_dist = fplib2.get_fpdist(self.ntyp, self.types, fpm, fpx)
+                # Make sure types is not None before calling the function
+                if self.types is None:
+                    print("Warning: self.types is None in update_minima loop!")
+                    continue
+                fp_dist = libfp.get_fp_dist(fpm, fpx, self.types)
                 self.update_dij(idm, x.id, fp_dist)
 
         for x in self.db.select(ctyp='saddle'):
-            fpx = x.data['fp']
-            fp_dist = fplib2.get_fpdist(self.ntyp, self.types, fpm, fpx)
+            fpx = np.array(x.data['fp'])
+            # fp_dist = fplib2.get_fpdist(self.ntyp, self.types, fpm, fpx)
+            # Make sure types is not None before calling the function
+            if self.types is None:
+                print("Warning: self.types is None in update_minima saddle loop!")
+                continue
+            fp_dist = libfp.get_fp_dist(fpm, fpx, self.types)
             self.update_dij(idm, x.id, fp_dist)
         return idm, isnew
     
@@ -660,8 +784,13 @@ class Pallas(object):
         es = saddle.get_potential_energy()
         isnew = True
         for x in self.db.select(ctyp='saddle'):
-            fpx = x.data['fp']
-            fp_dist = fplib2.get_fpdist(self.ntyp, self.types, fps, fpx)
+            fpx = np.array(x.data['fp'])
+            # fp_dist = fplib2.get_fpdist(self.ntyp, self.types, fps, fpx)
+            # Make sure types is not None before calling the function
+            if self.types is None:
+                print("Warning: self.types is None in update_saddle!")
+                continue
+            fp_dist = libfp.get_fp_dist(fps, fpx, self.types)
             ediff = np.abs(es - x.data['energy'])
             if fp_dist < 0.005 and ediff < 0.001:
                 ids = x.id
@@ -673,13 +802,23 @@ class Pallas(object):
 
         for x in self.db.select(ctyp='saddle'):
             if x.id != ids:    
-                fpx = x.data['fp']
-                fp_dist = fplib2.get_fpdist(self.ntyp, self.types, fps, fpx)
+                fpx = np.array(x.data['fp'])
+                # fp_dist = fplib2.get_fpdist(self.ntyp, self.types, fps, fpx)
+                # Make sure types is not None before calling the function
+                if self.types is None:
+                    print("Warning: self.types is None in update_saddle loop!")
+                    continue
+                fp_dist = libfp.get_fp_dist(fps, fpx, self.types)
                 self.update_dij(ids, x.id, fp_dist)
         
         for x in self.db.select(ctyp='minima'):
-            fpx = x.data['fp']
-            fp_dist = fplib2.get_fpdist(self.ntyp, self.types, fps, fpx)
+            fpx = np.array(x.data['fp'])
+            # fp_dist = fplib2.get_fpdist(self.ntyp, self.types, fps, fpx)
+            # Make sure types is not None before calling the function
+            if self.types is None:
+                print("Warning: self.types is None in update_saddle minima loop!")
+                continue
+            fp_dist = libfp.get_fp_dist(fps, fpx, self.types)
             self.update_dij(ids, x.id, fp_dist)
         return ids, isnew
 
@@ -691,31 +830,55 @@ class PallasAtom(Atoms):
         # Initialize any new attributes for the subclass
         self.natx = 200
         self.fpcutoff = 5.5
-        self.lmax = 0
         self.fp = None
         self.converged = False
         self.id = None
+        self.types = None
+        self.znucl = None
 
     def get_fp(self):
+        types = self.types
+        znucl = self.znucl
+        natx = self.natx
         if self.fp is None:
-            self.fp = self.cal_fp()
+            # Check necessary attributes are set
+            if self.types is None:
+                print("Warning: types is None in PallasAtom.get_fp!")
+                return None
+            if self.znucl is None or len(self.znucl) == 0:
+                print("Warning: znucl is None or empty in PallasAtom.get_fp!")
+                return None
+                
+            try:
+                self.fp = self.cal_fp()
+            except Exception as e:
+                print(f"Error calculating fingerprint: {e}")
+                return None
         return self.fp
     
     def cal_fp(self):
-        # Example new function
         lat = self.get_cell()
         rxyz = self.get_positions()
-        types = np.array([1,1,1,1,2,2,2,2])
-        # znucl = self.get_atomic_numbers()
-        znucl = self.znucl = [48, 34]
-        ntyp = 2
-        fp = fplib2.get_fp(False, ntyp, self.natx, self.lmax, lat, rxyz, types, znucl, self.fpcutoff)
-        self.fp = fp
-        return fp
-
-    def another_function(self):
-        # Another new function
-        print("This function could perform operations specific to EnhancedAtom.")
+        types = self.types
+        znucl = self.znucl
+        natx = self.natx
+        
+        # Safety checks
+        if types is None:
+            print("Warning: types is None in PallasAtom.cal_fp!")
+            return None
+        if znucl is None or len(znucl) == 0:
+            print("Warning: znucl is None or empty in PallasAtom.cal_fp!")
+            return None
+            
+        try:
+            cell = (lat, rxyz, types, znucl)
+            fp = libfp.get_lfp(cell, cutoff=self.fpcutoff, log=False, natx = natx, orbital='s')
+            self.fp = fp
+            return fp
+        except Exception as e:
+            print(f"Error in libfp.get_lfp: {e}")
+            return None
 
 
 def main():
@@ -740,18 +903,23 @@ def find_path(graph, start, end):
     
     Args:
     graph (networkx.Graph): The graph representing the energy landscape.
+    start, end: The starting and ending node IDs
     
     Returns:
-    list: The minimax path between the two lowest energy minima.
+    list: Paths sorted by energy barrier (lowest first) and then by length
     """
-    # Find the two lowest energy minima
-    # minima = [node for node, data in graph.nodes(data=True) if data['xname'].startswith('M')]
-    # minima.sort(key=lambda x: graph.nodes[x]['e'])
-    # start, end = minima[:2]
     
     def minimax_cost(path):
-        """Calculate the minimax cost of a path."""
-        return max(graph.nodes[node]['e'] for node in path)
+        """Calculate the minimax cost of a path using edge weights."""
+        max_weight = 0
+        total_dist = 0
+        for i in range(len(path) - 1):
+            edge_data = graph.get_edge_data(path[i], path[i+1])
+            weight = edge_data.get('weight', float('inf'))
+            dist = edge_data.get('dist', float('inf'))
+            max_weight = max(max_weight, weight)
+            total_dist += dist
+        return max_weight, total_dist
     
     def dfs_paths(start, end, path=None):
         """Depth-first search to find all paths."""
@@ -765,10 +933,9 @@ def find_path(graph, start, end):
     
     # Find all paths and sort them by minimax cost and length
     all_paths = list(dfs_paths(start, end))
-    all_paths.sort(key=lambda p: (minimax_cost(p), len(p)))
+    # Sort by: 1) max energy barrier, 2) total fingerprint distance, 3) path length 
+    all_paths.sort(key=lambda p: (minimax_cost(p)[0], minimax_cost(p)[1], len(p)))
     
-    # Return the path with the lowest minimax cost and least intermediate states
-    # return all_paths[0] if all_paths else None
     return all_paths
 
 
@@ -789,12 +956,42 @@ def listpath():
     if paths:
         print(f"Found {len(paths)} paths between {start} and {end}:")
         for i, path in enumerate(paths, 1):
-            minimax_cost = max(G.nodes[node]['e'] for node in path)
-            print(f"\nPath {i}: Minimax cost = {minimax_cost:.4f}, Length = {len(path)}")
+            # Calculate path properties using edge attributes
+            max_energy = 0
+            total_distance = 0
+            
+            for j in range(len(path)-1):
+                edge_data = G.get_edge_data(path[j], path[j+1])
+                weight = edge_data.get('weight', float('inf'))
+                dist = edge_data.get('dist', float('inf'))
+                max_energy = max(max_energy, weight)
+                total_distance += dist
+            
+            print(f"\nPath {i}: Max Energy Barrier = {max_energy:.4f}, Total FP Distance = {total_distance:.4f}, Length = {len(path)}")
             
             # Create a folder for this path
             path_folder = f"path_{i}"
             os.makedirs(path_folder, exist_ok=True)
+            
+            # Write path information to a summary file
+            with open(os.path.join(path_folder, "path_info.txt"), 'w') as f:
+                f.write(f"Path {i}\n")
+                f.write(f"Max Energy Barrier: {max_energy:.6f}\n")
+                f.write(f"Total FP Distance: {total_distance:.6f}\n")
+                f.write(f"Number of nodes: {len(path)}\n\n")
+                f.write("Node details:\n")
+                
+                for j, node in enumerate(path):
+                    node_data = G.nodes[node]
+                    node_type = 'Minimum' if node_data['xname'].startswith('M') else 'Saddle'
+                    f.write(f"Node {node} ({node_type}): Energy = {node_data['e']:.6f}, Volume = {node_data['volume']:.6f}\n")
+                    
+                    # Write edge information
+                    if j < len(path) - 1:
+                        edge_data = G.get_edge_data(path[j], path[j+1])
+                        edge_weight = edge_data.get('weight', float('inf'))
+                        edge_dist = edge_data.get('dist', float('inf'))
+                        f.write(f"  Edge to next node: Weight = {edge_weight:.6f}, FP Distance = {edge_dist:.6f}\n")
             
             for node in path:
                 node_data = G.nodes[node]
@@ -811,12 +1008,6 @@ def listpath():
     else:
         print(f"No paths found between {start} and {end}.")
     
-    types = np.array([1,1,1,1,2,2,2,2])
-    ntyp = 2
-
-
-
-
     # Create a directory to store all path files
     os.makedirs("path_energies", exist_ok=True)
 
@@ -824,7 +1015,7 @@ def listpath():
         filename = f"path_energies/path_{i}_energy.txt"
         with open(filename, 'w') as f:
             f.write(f"#Path {i}\n")
-            f.write("#FP_Distance Energy\n")
+            f.write("#Distance Energy EdgeWeight\n")
             
             cumulative_distance = 0.0
             for j, node in enumerate(path):
@@ -832,40 +1023,16 @@ def listpath():
                 energy = node_data['e']
                 
                 if j == 0:
-                    f.write(f"{cumulative_distance:.6f} {energy:.6f}\n")
+                    f.write(f"{cumulative_distance:.6f} {energy:.6f} 0.0\n")
                 else:
                     prev_node = path[j-1]
-                    prev_fp = db.get(id=prev_node).data['fp']
-                    curr_fp = db.get(id=node).data['fp']
-                    fp_dist = fplib2.get_fpdist(ntyp, types, prev_fp, curr_fp)
-                    cumulative_distance += fp_dist
-                    f.write(f"{cumulative_distance:.6f} {energy:.6f}\n")
+                    edge_data = G.get_edge_data(prev_node, node)
+                    edge_weight = edge_data.get('weight', float('inf'))
+                    edge_dist = edge_data.get('dist', 0.0)
+                    cumulative_distance += edge_dist
+                    f.write(f"{cumulative_distance:.6f} {energy:.6f} {edge_weight:.6f}\n")
 
     print("Energy profiles for all paths have been written to separate files in the 'path_energies' directory.")
-    # with open('pathenergy.txt', 'w') as f:
-    #     for i, path in enumerate(paths, 1):
-    #         f.write(f"#Path {i}\n")
-    #         f.write("#FP_Distance_Energy\n")
-            
-    #         cumulative_distance = 0.0
-    #         for j, node in enumerate(path):
-    #             node_data = G.nodes[node]
-    #             energy = node_data['e']
-                
-    #             if j == 0:
-    #                 f.write(f"{cumulative_distance:.6f} {energy:.6f}\n")
-    #             else:
-    #                 prev_node = path[j-1]
-    #                 prev_fp = db.get(id=prev_node).data['fp']
-    #                 curr_fp = db.get(id=node).data['fp']
-    #                 fp_dist = fplib2.get_fpdist(ntyp, types, prev_fp, curr_fp)
-
-    #                 cumulative_distance += fp_dist
-    #                 f.write(f"{cumulative_distance:.6f} {energy:.6f}\n")
-            
-    #         f.write("\n")  # Add a blank line between paths
-    
-    # print("Energy profiles for all paths have been written to pathenergy.txt")
 
 def test():
     pp0 = read('POSCAR', format='vasp')

@@ -84,9 +84,9 @@ class XCalculator(Calculator):
     default_parameters = {
                           'contract': False,
                           'ntyp': 1,
-                          'nx': 300,
+                          'nx': 200,
                           'lmax': 0,
-                          'cutoff': 4.0,
+                          'cutoff': 5.5,
                           'znucl': None
                           }
 
@@ -96,6 +96,7 @@ class XCalculator(Calculator):
                  atoms = None,
                  comm = None, # MPI communicator
                  parallel = False, # Switch to enable/disable MPI for this calculator
+                 ntyp = 1,
                  fp0 = None,
                  ci = None, 
                  **kwargs
@@ -132,6 +133,7 @@ class XCalculator(Calculator):
         self.rank = comm.Get_rank()
         self.parallel = parallel
         self.fp0 = fp0
+        self.ntyp = ntyp
         self.ci = ci if ci is not None else []
         self._ci_initialized = False
 
@@ -172,8 +174,9 @@ class XCalculator(Calculator):
         if 'command' in kwargs:
             self.command = kwargs.pop('command')
 
-        changed_parameters.update(Calculator.set(self, **kwargs))
+        
         self.default_parameters.update(Calculator.set(self, **kwargs))
+        changed_parameters.update(Calculator.set(self, **kwargs))
 
         if changed_parameters:
             self.clear_results()  # We don't want to clear atoms
@@ -642,7 +645,6 @@ class XCalculator(Calculator):
             
             # Ensure the index is valid
             idx = self.ci[k]
-                
             fp12 = (fp[k] - self.fp0[idx])
             for l in range(3):
                 ff = 0.0
@@ -911,11 +913,6 @@ class XCalculator(Calculator):
         else:
             print("Force consistency test failed!")
 
-
-
-########################################################################################
-####################### Helper functions for the VASP calculator #######################
-########################################################################################
 
 def check_atoms(atoms: Atoms) -> None:
     """Perform checks on the atoms object, to verify that
