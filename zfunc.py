@@ -7,7 +7,7 @@ import numpy as np
 import pickle
 from ase.io import read, write, Trajectory
 from ase.optimize import FIRE, BFGS
-from ase.filters import ExpCellFilter
+from ase.filters import FrechetCellFilter
 from copy import deepcopy as cp
 
 
@@ -31,7 +31,7 @@ def local_optimization(patoms):
     # atoms = cp(patoms)
     atoms=patoms
     atoms.calc = calc
-    ecf = ExpCellFilter(atoms)
+    ecf = FrechetCellFilter(atoms)
     opt = FIRE(ecf, maxstep=0.1, logfile='opt.log')
     opt.run(fmax=0.001, steps=2000)
     fmax = np.max(np.abs(ecf.get_forces()))
@@ -44,10 +44,6 @@ def local_optimization(patoms):
     new_cell = lower_triangular_cell(atoms)
     atoms.set_cell(new_cell, scale_atoms=True)
     atoms.cal_fp()
-    # print ('cell', atoms.get_cell())
-    # print ('fp', atoms.get_fp())
-
-    # print ('calc', atoms.calc)
     return atoms
 
 
