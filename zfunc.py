@@ -90,20 +90,30 @@ def cal_saddle(patoms):
 
 
 def getx(cell1, cell2):
-    mode = np.zeros((itin.nat + 3, 3))
+    """Return normalized displacement vector between two structures.
+
+    This helper was previously relying on a global ``itin`` object for the
+    number of atoms in the system.  ``itin`` is not defined anywhere in the
+    code base which resulted in a ``NameError`` whenever ``getx`` was used.
+    The function now determines the number of atoms directly from ``cell1``
+    so it works independently of any external state.
+    """
+
+    nat = len(cell1)
+    mode = np.zeros((nat + 3, 3))
     mode[-3:] = cell2.get_lattice() - cell1.get_lattice()
     ilat = np.linalg.inv(cell1.get_lattice())
     vol = cell1.get_volume()
-    jacob = (vol / itin.nat)**(1.0 / 3.0) * itin.nat**0.5
+    jacob = (vol / nat) ** (1.0 / 3.0) * nat ** 0.5
     mode[-3:] = np.dot(ilat, mode[-3:]) * jacob
     pos1 = cell1.get_cart_positions()
     pos2 = cell2.get_cart_positions()
-    for i in range(itin.nat):
+    for i in range(nat):
         mode[i] = pos2[i] - pos1[i]
     try:
         mode = vunit(mode)
-    except:
-        mode = np.zeros((itin.nat + 3, 3))
+    except Exception:
+        mode = np.zeros((nat + 3, 3))
     return mode
 
 def lower_triangular_cell(atoms):
