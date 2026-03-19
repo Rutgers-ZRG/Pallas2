@@ -1562,15 +1562,15 @@ class Pallas:
 
     def _fp_guided_step(self, current, target_fp, types,
                         step_scale, alpha=1.0, side=""):
-        """One step of FP-guided chain growing.
+        """One step: FP-drag to find saddle region → dimer refine → descend.
 
         Parameters
         ----------
         current : PallasAtom — current chain tip (optimized minimum).
         target_fp : np.ndarray — target fingerprint to grow toward.
         types : np.ndarray — atom type array.
-        step_scale : float — perturbation magnitude.
-        alpha : float — FP/random mixing ratio (1.0 = pure FP, 0.0 = pure random).
+        step_scale : float — perturbation magnitude (unused, kept for API).
+        alpha : float — FP/random mixing ratio for dimer mode initialization.
         side : str — label for logging.
 
         Returns
@@ -1579,25 +1579,30 @@ class Pallas:
         """
         cfg = self.config
 
-        # Step 1: Build search mode from FP gradient + random component
-        fp_mode = self._fp_gradient_mode(current, target_fp)
+        # Phase A: FP-drag to find approximate saddle (energy maximum)
+        drag_result = self._fp_drag_segment(
+            current, target_fp, types,
+            n_images=10, relax_steps=30, relax_fmax=0.05)
+
+        if drag_result is None:
+            print(f"  [{side}] FP-drag failed")
+            return current
+
+        saddle_approx = drag_result['saddle_structure']
+        h_approx = drag_result['saddle_energy']
+        h_cur = self.G.nodes[current.id]['e']
+
+        # Phase B: Dimer refinement at the energy maximum
+        fp_mode = self._fp_gradient_mode(saddle_approx, target_fp)
         rand_mode = self._gen_random_velocity(current)
         mode = vunit(alpha * fp_mode + (1.0 - alpha) * rand_mode)
 
-        # Step 2+3: Perturb along mode, run dimer with this mode
-        saddle = None
-        for attempt in range(cfg.max_retries + 1):
-            try:
-                scale = step_scale * (0.5 ** attempt)  # halve on retry
-                saddle = self._fp_guided_saddle(current, mode, scale)
-                break
-            except Exception as e:
-                if attempt < cfg.max_retries:
-                    print(f"  [{side}] Saddle attempt {attempt+1} failed "
-                          f"(scale={scale:.3f}): {e}, retrying...")
-                else:
-                    print(f"  [{side}] All saddle attempts failed: {e}")
-                    return current
+        try:
+            saddle = cal_saddle(saddle_approx, fmax=cfg.saddle_fmax,
+                                steps=cfg.saddle_steps, mode=mode)
+        except Exception as e:
+            print(f"  [{side}] Dimer failed: {e}")
+            return current
 
         # Register saddle
         sad_id, _ = self._update_saddle(saddle)
@@ -1607,26 +1612,17 @@ class Pallas:
         self.G.add_node(sad_id, xname=f'S{sad_id}', e=h_sad,
                         volume=saddle.get_volume())
 
-        # Edge: current → saddle
-        fp_c = current.get_fp()
-        fp_s = saddle.get_fp()
-        d_cs = fp_distance(fp_c, fp_s, types)
-        h_cur = self.G.nodes[current.id]['e']
-        self.G.add_edge(current.id, sad_id,
-                        weight=max(h_cur, h_sad), dist=d_cs)
-
-        # Step 4: Log saddle info (curvature is advisory, not a hard reject)
         curv = getattr(saddle, 'dimer_curvature', None)
         curv_str = f", κ={curv:.3f}" if curv is not None else ""
 
-        if h_sad < h_cur:
-            print(f"  [{side}] WARNING: saddle S{sad_id} ({h_sad:.3f}) "
-                  f"< current M{current.id} ({h_cur:.3f}){curv_str}")
+        # Edge: current → saddle
+        fp_s = saddle.get_fp()
+        d_cs = fp_distance(current.get_fp(), fp_s, types)
+        self.G.add_edge(current.id, sad_id,
+                        weight=max(h_cur, h_sad), dist=d_cs)
 
-        # Step 5: Escape saddle along dimer mode toward target, then bias
+        # Phase C: Escape saddle → next minimum
         escaped = self._saddle_escape(saddle, target_fp)
-
-        # Step 6: Optimize on real PES
         new_min = local_optimization(escaped, fmax=cfg.opt_fmax,
                                      steps=cfg.opt_steps)
         min_id, _ = self._update_minima(new_min)
@@ -1637,16 +1633,14 @@ class Pallas:
         self.G.add_node(min_id, xname=f'M{min_id}', e=h_min,
                         volume=new_min.get_volume())
 
-        # Edge: saddle → new minimum
         fp_m = new_min.get_fp()
         d_sm = fp_distance(fp_s, fp_m, types)
         self.G.add_edge(sad_id, min_id,
                         weight=max(h_sad, h_min), dist=d_sm)
 
-        # Progress report
         d_target = fp_distance(fp_m, target_fp, types)
-        print(f"  [{side}] S{sad_id} ({h_sad:.3f}) → M{min_id} ({h_min:.3f}) "
-              f"| d(→target)={d_target:.5f}")
+        print(f"  [{side}] drag→S{sad_id} ({h_sad:.3f}{curv_str}) "
+              f"→ M{min_id} ({h_min:.3f}) | d(→target)={d_target:.5f}")
         return new_min
 
     def _fp_gradient_mode(self, structure, target_fp):
