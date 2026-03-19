@@ -734,6 +734,18 @@ class SolidStateDimer:
                 self.converged_flag = True
                 break
 
+            # Stuck at a minimum: forces ~ 0 but curvature > 0
+            # Re-kick with a random perturbation to escape
+            if max_force < fmax and curv > 0:
+                kick = self._random_vector(np.zeros_like(Ftrans))
+                kick_step = kick * self.max_step * 0.5
+                self.set_positions(self.get_positions() + kick_step)
+                V = kick * self.time_step  # reset velocity along kick
+                if flog is not None:
+                    flog.write(f"# Re-kick at step {step_count} "
+                               f"(stuck at minimum, κ={curv:.4f})\n")
+                    flog.flush()
+
         if flog is not None:
             status = "converged" if self.converged_flag else "not converged"
             flog.write(f"# {status} after {step_count} steps "
