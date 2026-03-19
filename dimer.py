@@ -648,7 +648,12 @@ class SolidStateDimer:
             # At a saddle point - follow perpendicular component but invert parallel
             gamma = 1.0  # Scaling factor for parallel component
             self.modified_forces = perpendicular_component - gamma * parallel_component
-            
+
+        # Store curvature and mode on inner atoms so they survive ASE's
+        # OptimizableAtoms wrapper (which shadows the dimer's own attributes)
+        self.atoms.dimer_curvature = self.curvature
+        self.atoms.dimer_mode = self.mode.copy()
+
         # Return full or truncated force vector depending on ss mode
         if self.solid_state:
             return self.modified_forces

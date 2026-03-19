@@ -877,6 +877,210 @@ class Pallas:
 
         return best_path, best_bn
 
+    # ── Saddle validation ──────────────────────────────────────────────
+
+    def _validate_saddle(self, saddle, types):
+        """Validate a saddle point: curvature check + connectivity test.
+
+        1. Curvature check: dimer curvature must be negative.
+        2. Connectivity: push along ±dimer_mode, relax on real PES,
+           verify the two endpoints are distinct minima.
+
+        Parameters
+        ----------
+        saddle : PallasAtom — saddle with .dimer_mode and .dimer_curvature.
+        types : np.ndarray — atom type array.
+
+        Returns
+        -------
+        dict with keys:
+            valid : bool — True if saddle passes both checks.
+            curvature : float — dimer curvature value.
+            min_plus : PallasAtom or None — minimum from +mode descent.
+            min_minus : PallasAtom or None — minimum from -mode descent.
+            reason : str — failure reason if not valid.
+        """
+        cfg = self.config
+        result = {'valid': False, 'curvature': None,
+                  'min_plus': None, 'min_minus': None, 'reason': ''}
+
+        # Check 1: Curvature must be negative
+        curvature = getattr(saddle, 'dimer_curvature', None)
+        result['curvature'] = curvature
+
+        if curvature is None:
+            result['reason'] = 'no curvature stored'
+            return result
+        if curvature >= 0:
+            result['reason'] = f'positive curvature ({curvature:.4f})'
+            return result
+
+        # Check 2: Push ±mode, relax, verify distinct minima
+        dimer_mode = getattr(saddle, 'dimer_mode', None)
+        if dimer_mode is None:
+            result['reason'] = 'no dimer_mode stored'
+            return result
+
+        mode = vunit(dimer_mode)
+        natom = len(saddle)
+        vol = saddle.get_volume()
+        jacob = (vol / natom) ** (1.0 / 3.0) * natom ** 0.5
+        push = cfg.fp_push_scale * 3.0  # same scale as _saddle_escape
+
+        min_plus = self._push_and_relax(saddle, mode, push, jacob)
+        min_minus = self._push_and_relax(saddle, -mode, push, jacob)
+
+        result['min_plus'] = min_plus
+        result['min_minus'] = min_minus
+
+        if min_plus is None or min_minus is None:
+            result['reason'] = 'relaxation failed'
+            return result
+
+        # Check the two minima are distinct
+        d = fp_distance(min_plus.get_fp(), min_minus.get_fp(), types)
+        ediff = abs(min_plus.get_potential_energy()
+                    - min_minus.get_potential_energy())
+
+        if d < cfg.dist_threshold and ediff < cfg.ediff:
+            result['reason'] = (f'same minimum on both sides '
+                                f'(d={d:.5f}, dE={ediff:.5f})')
+            return result
+
+        result['valid'] = True
+        return result
+
+    def _push_and_relax(self, saddle, mode, push_scale, jacob):
+        """Push saddle along mode and relax on real PES.
+
+        Returns optimized PallasAtom or None on failure.
+        """
+        try:
+            atoms = cp(saddle)
+            natom = len(atoms)
+            scaled = mode * push_scale
+            cellt = atoms.get_cell() + np.dot(atoms.get_cell(),
+                                              scaled[-3:] / jacob)
+            atoms.set_cell(cellt, scale_atoms=True)
+            atoms.set_positions(atoms.get_positions() + scaled[:-3])
+            if hasattr(atoms, 'invalidate_fp'):
+                atoms.invalidate_fp()
+
+            cfg = self.config
+            opt = local_optimization(atoms, fmax=cfg.opt_fmax,
+                                     steps=cfg.opt_steps)
+            return opt
+        except Exception:
+            return None
+
+    def validate_graph(self):
+        """Validate all saddle nodes in the graph and prune invalid ones.
+
+        For each saddle:
+        1. Check curvature < 0
+        2. Push ±mode, relax, verify distinct connected minima
+        3. Update edges: connect saddle to its verified minima
+        4. Remove saddle nodes that fail validation
+
+        Returns
+        -------
+        dict : summary with counts of valid/invalid/pruned saddles.
+        """
+        cfg = self.config
+        types = self._get_types(self.init_minima[0])
+
+        saddle_nodes = [(n, d) for n, d in self.G.nodes(data=True)
+                        if d['xname'].startswith('S')]
+
+        print(f"\nValidating {len(saddle_nodes)} saddle points...")
+
+        stats = {'total': len(saddle_nodes), 'valid': 0,
+                 'invalid': 0, 'pruned': 0, 'new_edges': 0}
+
+        for node_id, node_data in saddle_nodes:
+            # Load saddle from DB
+            try:
+                saddle_row = self.db.get(id=node_id)
+                saddle = PallasAtom(self.db.get_atoms(node_id))
+                saddle.znucl = cfg.znucl
+                saddle.fpcutoff = cfg.fpcutoff
+                saddle.natx = cfg.natx
+                saddle.id = node_id
+                saddle.fp = np.array(saddle_row.data['fp'])
+            except Exception:
+                print(f"  S{node_id}: cannot load from DB, pruning")
+                self.G.remove_node(node_id)
+                stats['pruned'] += 1
+                continue
+
+            # Retrieve dimer_mode/curvature if stored in DB
+            saddle.dimer_curvature = saddle_row.data.get('curvature', None)
+            dimer_mode_list = saddle_row.data.get('dimer_mode', None)
+            if dimer_mode_list is not None:
+                saddle.dimer_mode = np.array(dimer_mode_list)
+            else:
+                saddle.dimer_mode = None
+
+            # If no dimer info stored, we can only do energy-based checks
+            if saddle.dimer_mode is None:
+                # Check: saddle should be higher than at least one neighbor
+                neighbors = list(self.G.neighbors(node_id))
+                neighbor_es = [self.G.nodes[n]['e'] for n in neighbors
+                               if n in self.G.nodes]
+                if neighbor_es and node_data['e'] <= min(neighbor_es):
+                    print(f"  S{node_id} ({node_data['e']:.4f}): "
+                          f"INVALID — below all neighbors, pruning")
+                    self.G.remove_node(node_id)
+                    stats['invalid'] += 1
+                    stats['pruned'] += 1
+                else:
+                    print(f"  S{node_id} ({node_data['e']:.4f}): "
+                          f"no dimer data, keeping (energy OK)")
+                    stats['valid'] += 1
+                continue
+
+            # Full validation with connectivity
+            result = self._validate_saddle(saddle, types)
+            curv_str = f"κ={result['curvature']:.4f}" \
+                if result['curvature'] is not None else "κ=?"
+
+            if result['valid']:
+                print(f"  S{node_id} ({node_data['e']:.4f}): "
+                      f"VALID ({curv_str})")
+                stats['valid'] += 1
+
+                # Register the verified minima and add edges
+                for m in [result['min_plus'], result['min_minus']]:
+                    if m is None:
+                        continue
+                    mid, _ = self._update_minima(m)
+                    m.id = mid
+                    h_m = (m.get_volume() * cfg.press * GPa
+                           + m.get_potential_energy() - self.baseenergy)
+                    self.G.add_node(mid, xname=f'M{mid}', e=h_m,
+                                    volume=m.get_volume())
+                    if not self.G.has_edge(node_id, mid):
+                        fp_s = saddle.get_fp()
+                        fp_m = m.get_fp()
+                        d = fp_distance(fp_s, fp_m, types)
+                        self.G.add_edge(node_id, mid,
+                                        weight=max(node_data['e'], h_m),
+                                        dist=d)
+                        stats['new_edges'] += 1
+            else:
+                print(f"  S{node_id} ({node_data['e']:.4f}): "
+                      f"INVALID — {result['reason']} ({curv_str}), pruning")
+                self.G.remove_node(node_id)
+                stats['invalid'] += 1
+                stats['pruned'] += 1
+
+        self._save_state()
+
+        print(f"\nValidation complete: {stats['valid']} valid, "
+              f"{stats['invalid']} invalid, {stats['pruned']} pruned, "
+              f"{stats['new_edges']} new edges")
+        return stats
+
     def _closest_to(self, minima_list, target_fp, types):
         """Return the minimum from the list closest to target in FP space."""
         best = minima_list[0]
@@ -970,10 +1174,18 @@ class Pallas:
         self.G.add_edge(current.id, sad_id,
                         weight=max(h_cur, h_sad), dist=d_cs)
 
-        # Step 4: Validate saddle energy
+        # Step 4: Validate saddle
+        curv = getattr(saddle, 'dimer_curvature', None)
+        curv_str = f", κ={curv:.3f}" if curv is not None else ""
+
+        if curv is not None and curv >= 0:
+            print(f"  [{side}] SKIP: S{sad_id} has positive curvature "
+                  f"({curv:.4f}) — not a saddle")
+            return current
+
         if h_sad < h_cur:
             print(f"  [{side}] WARNING: saddle S{sad_id} ({h_sad:.3f}) "
-                  f"< current M{current.id} ({h_cur:.3f})")
+                  f"< current M{current.id} ({h_cur:.3f}){curv_str}")
 
         # Step 5: Escape saddle along dimer mode toward target, then bias
         escaped = self._saddle_escape(saddle, target_fp)
@@ -1216,10 +1428,15 @@ class Pallas:
                 break
 
         if isnew:
-            ids = self.db.write(
-                saddle, ctyp='saddle',
-                data={'fp': fps.tolist(), 'energy': float(es)}
-            )
+            # Store dimer mode and curvature for later validation
+            data = {'fp': fps.tolist(), 'energy': float(es)}
+            dimer_mode = getattr(saddle, 'dimer_mode', None)
+            if dimer_mode is not None:
+                data['dimer_mode'] = dimer_mode.tolist()
+            curvature = getattr(saddle, 'dimer_curvature', None)
+            if curvature is not None:
+                data['curvature'] = float(curvature)
+            ids = self.db.write(saddle, ctyp='saddle', data=data)
 
         for x in self.db.select(ctyp='saddle'):
             if x.id != ids:

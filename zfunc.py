@@ -126,7 +126,11 @@ def cal_saddle(patoms, fmax=0.01, steps=2000, calc=None, mode=None):
     if not atoms.converged:
         print(f"Warning: dimer did not converge (fmax={actual_fmax:.4f})")
 
-    # Store dimer's final mode (unstable direction) and curvature on atoms
+    # Capture final dimer mode and curvature.
+    # ASE's OptimizableAtoms wrapper bypasses the dimer's get_forces
+    # (via __getattr__ → inner atoms), so d.curvature may be stale.
+    # One extra get_forces call ensures curvature is up-to-date.
+    d.get_forces()
     atoms.dimer_mode = d.mode.copy()
     atoms.dimer_curvature = d.curvature
 
