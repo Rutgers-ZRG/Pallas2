@@ -667,9 +667,51 @@ class SolidStateDimer:
         else:
             return self.num_atoms
 
+    # ── ASE Optimizable protocol ──────────────────────────────────────
+    # These methods let ASE's FIRE/BFGS use the dimer's own get_forces
+    # and set_positions (with cell DOFs), instead of bypassing to the
+    # inner atoms via __getattr__ → OptimizableAtoms(inner_atoms).
+
+    def __ase_optimizable__(self):
+        """Return self so ASE optimizers use dimer forces, not raw PES."""
+        return self
+
+    def ndofs(self):
+        """Number of generalized degrees of freedom."""
+        return len(self) * 3
+
+    def get_x(self):
+        """Current generalized coordinates as flat array."""
+        return self.get_positions().ravel()
+
+    def set_x(self, x):
+        """Set generalized coordinates from flat array."""
+        self.set_positions(x.reshape(len(self), 3))
+
+    def get_gradient(self):
+        """Dimer-modified forces as flat array (ASE convention: neg gradient)."""
+        return self.get_forces().ravel()
+
+    def get_value(self):
+        """Potential energy of the current configuration."""
+        return self.atoms.get_potential_energy()
+
+    def iterimages(self):
+        """Yield atoms for trajectory writing."""
+        yield self.atoms
+
+    def gradient_norm(self, gradient):
+        """Max generalized force magnitude (positions + cell rows)."""
+        forces = gradient.reshape(-1, 3)
+        return np.linalg.norm(forces, axis=1).max()
+
+    def converged(self, gradient, fmax):
+        """Check convergence of dimer-modified forces."""
+        return self.gradient_norm(gradient) < fmax
+
     def __getattr__(self, attr):
         """Pass through attributes not found to the atoms object."""
         if hasattr(self, 'atoms'):
             return getattr(self.atoms, attr)
         raise AttributeError(f"'{self.__class__.__name__}' object has no attribute '{attr}'")
-        
+
