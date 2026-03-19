@@ -539,8 +539,8 @@ class SolidStateDimer:
             a1 = (curvature - trial_curvature + b1 * sin(2 * phi_1)) / max(1 - cos(2 * phi_1), EPSILON)
             a0 = 2.0 * (curvature - a1)
             
-            # Calculate optimal rotation angle
-            phi_min = 0.5 * atan(b1 / max(a1, EPSILON))
+            # Calculate optimal rotation angle (a1 can be negative — do NOT clip)
+            phi_min = 0.5 * atan(b1 / a1)
             min_curvature = 0.5 * a0 + a1 * cos(2.0 * phi_min) + b1 * sin(2 * phi_min)
 
             # Check if we found a minimum or maximum
@@ -568,10 +568,10 @@ class SolidStateDimer:
             curvature = min_curvature
 
             # Update dimer forces using extrapolation
-            safe_sin_phi1 = max(sin(phi_1), EPSILON)
+            # sin(phi_1) can be negative — do NOT clip (matches TSASE)
             dimer_forces = (
-                dimer_forces * (sin(phi_1 - phi_min) / safe_sin_phi1) +
-                trial_forces * (sin(phi_min) / safe_sin_phi1) +
+                dimer_forces * (sin(phi_1 - phi_min) / sin(phi_1)) +
+                trial_forces * (sin(phi_min) / sin(phi_1)) +
                 central_forces * (1.0 - cos(phi_min) - sin(phi_min) * tan(phi_1 * 0.5))
             )
 
@@ -700,8 +700,16 @@ class SolidStateDimer:
         return np.linalg.norm(forces, axis=1).max()
 
     def converged(self, gradient, fmax):
-        """Check convergence of dimer-modified forces."""
-        return self.gradient_norm(gradient) < fmax
+        """Check convergence: forces below threshold AND curvature negative.
+
+        Matches TSASE's search() logic: the dimer must keep going until
+        it finds a direction of negative curvature (true saddle), not
+        just any stationary point.
+        """
+        forces_converged = self.gradient_norm(gradient) < fmax
+        curvature_negative = (self.curvature is not None
+                              and self.curvature < 0)
+        return forces_converged and curvature_negative
 
     def __getattr__(self, attr):
         """Pass through attributes not found to the atoms object."""
