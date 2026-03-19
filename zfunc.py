@@ -127,10 +127,10 @@ def cal_saddle(patoms, fmax=0.01, steps=2000, calc=None, mode=None):
         atoms.set_positions(atoms.get_positions() + mode[:-3])
 
     # Run dimer search
-    # maxstep=0.05: smaller than default 0.1 to reduce oscillation
-    # dimer_separation=0.005: more robust curvature estimate than 0.001
+    # maxstep=0.02: conservative to avoid overshooting saddle region
+    # dimer_separation=0.005: robust curvature estimate
     d = SolidStateDimer(atoms, mode=mode, dimer_separation=0.005)
-    dyn = FIRE(d, maxstep=0.05, logfile='ssdimer.log')
+    dyn = FIRE(d, maxstep=0.02, logfile=None)
     dyn.run(fmax=fmax, steps=steps)
 
     actual_fmax = np.max(np.abs(atoms.get_forces()))
