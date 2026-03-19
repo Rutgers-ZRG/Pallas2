@@ -1,10 +1,11 @@
 """PALLAS — Phase Transition Pathway Sampling via Swarm Intelligence and Graph Theory.
 
 Automated method for finding transition pathways between crystal phases using:
-- Bidirectional PSO search with fingerprint-guided bias
+- FP-gradient-guided chain-growing search (primary method)
+- Bidirectional PSO search (legacy method)
 - Solid-state dimer method for saddle point location
 - NetworkX graph with minimax bottleneck path finding
-- torch_fplib GOM fingerprints for structural distance
+- torch_fplib GOM fingerprints for structural distance and gradients
 
 Dependencies: torch_fplib, MatterSim (via zfunc), ASE, NetworkX.
 """
@@ -26,7 +27,7 @@ import ase.db
 
 import torch
 import torch_fplib
-from xcal import XCalculator, atoms_to_cell
+from xcal import XCalculator, atoms_to_cell, fp_dist_with_assignment
 from zfunc import local_optimization, cal_saddle, vunit, vrand
 from barrier import minimax_path
 
@@ -58,6 +59,11 @@ class PallasConfig:
     saddle_steps: int = 2000        # max FIRE steps for dimer saddle search
     saddle_fmax: float = 0.01       # force convergence for saddle
     bias_steps: int = 60            # max FIRE steps for FP bias relaxation
+
+    # FP-guided search parameters
+    fp_step_scale: float = 0.5      # perturbation scale along FP gradient
+    fp_push_scale: float = 0.1      # post-saddle push scale toward target
+    max_retries: int = 2            # retries with smaller step on saddle failure
 
     # Convergence
     ediff: float = 0.001            # energy diff threshold for same structure
@@ -126,22 +132,25 @@ def fp_distance(fp1, fp2, types):
     -------
     float — averaged FP distance.
     """
-    fp1 = np.asarray(fp1)
-    fp2 = np.asarray(fp2)
-    return torch_fplib.get_fp_dist(fp1, fp2, np.asarray(types))
+    d, _ = fp_dist_with_assignment(fp1, fp2, types)
+    return d
 
 
 # ── Main PALLAS class ────────────────────────────────────────────────
 
 class Pallas:
-    """PALLAS bidirectional PSO pathway search engine.
+    """PALLAS pathway search engine.
+
+    Two search modes:
+    - ``run_fp_guided()`` — FP-gradient-guided chain growing (recommended)
+    - ``run_pso()`` — bidirectional PSO (legacy)
 
     Usage::
 
         config = PallasConfig(znucl=[6], press=10.0)
         pallas = Pallas(config)
         pallas.init_run(['POSCAR_graphite', 'POSCAR_diamond'])
-        graph = pallas.run_pso()
+        graph = pallas.run_fp_guided()
     """
 
     def __init__(self, config=None):
@@ -556,6 +565,335 @@ class Pallas:
         opt.run(fmax=0.01, steps=self.config.bias_steps)
         return atoms
 
+    # ── FP-guided chain-growing search ────────────────────────────────
+
+    def run_fp_guided(self):
+        """FP-gradient-guided bidirectional chain-growing pathway search.
+
+        Grows chains from both reactant (A) and product (B) simultaneously.
+        At each step:
+        1. Compute FP-gradient direction toward the opposite endpoint
+        2. Perturb along this direction (directed, not random)
+        3. Run dimer with FP-gradient as initial mode
+        4. Validate saddle (energy must exceed the departing minimum)
+        5. Push saddle toward target with small FP-gradient step
+        6. Optimize on real PES to find next minimum
+        7. Check if chains have connected
+
+        Returns
+        -------
+        nx.Graph — pathway network.
+        """
+        cfg = self.config
+        print("Starting FP-guided chain-growing search")
+
+        # Optimize endpoints
+        A = self._optimize_and_register(self.reactant, is_base=True)
+        B = self._optimize_and_register(self.product, is_base=False)
+
+        types = self._get_types(A)
+        d0 = fp_distance(A.get_fp(), B.get_fp(), types)
+        print(f"Initial FP distance A↔B: {d0:.5f}")
+
+        # Bidirectional chains
+        chain_A = [A]       # grows from A toward B
+        chain_B = [B]       # grows from B toward A
+
+        for step in range(cfg.maxstep):
+            tip_A = chain_A[-1]
+            tip_B = chain_B[-1]
+
+            # Current distance between chain tips
+            d_tips = fp_distance(tip_A.get_fp(), tip_B.get_fp(), types)
+            ediff = abs(tip_A.get_potential_energy()
+                        - tip_B.get_potential_energy())
+            print(f"\n=== Step {step+1}/{cfg.maxstep} | "
+                  f"d(tips)={d_tips:.5f}, ΔE={ediff:.5f} ===")
+
+            # Check if chains connected
+            if d_tips < cfg.dist_threshold and ediff < cfg.ediff:
+                h_a = self.G.nodes[tip_A.id]['e']
+                h_b = self.G.nodes[tip_B.id]['e']
+                self.G.add_edge(tip_A.id, tip_B.id,
+                                weight=max(h_a, h_b), dist=d_tips)
+                print(f"Chains connected! M{tip_A.id} ↔ M{tip_B.id}")
+                break
+
+            # Adaptive step scale: larger when far, smaller when close
+            progress = d_tips / max(d0, 1e-10)
+            step_scale = cfg.fp_step_scale * max(progress, 0.1)
+
+            # A-side: grow toward B
+            new_A = self._fp_guided_step(
+                tip_A, B.get_fp(), types, step_scale, side="A→B")
+            if new_A is not tip_A:
+                chain_A.append(new_A)
+
+            # B-side: grow toward A
+            new_B = self._fp_guided_step(
+                tip_B, A.get_fp(), types, step_scale, side="B→A")
+            if new_B is not tip_B:
+                chain_B.append(new_B)
+
+            self._save_state()
+
+        # Final path search
+        try:
+            path, bottleneck = minimax_path(self.G, A.id, B.id)
+            print(f"\nPath found: {' → '.join(str(n) for n in path)}")
+            print(f"Bottleneck energy: {bottleneck:.4f} eV")
+        except nx.NetworkXNoPath:
+            print("\nNo complete path found (increase maxstep)")
+
+        print(f"\nGraph: {self.G.number_of_nodes()} nodes, "
+              f"{self.G.number_of_edges()} edges")
+        print(f"A-chain length: {len(chain_A)}, B-chain length: {len(chain_B)}")
+        return self.G
+
+    def _fp_guided_step(self, current, target_fp, types,
+                        step_scale, side=""):
+        """One step of FP-guided chain growing.
+
+        Parameters
+        ----------
+        current : PallasAtom — current chain tip (optimized minimum).
+        target_fp : np.ndarray — target fingerprint to grow toward.
+        types : np.ndarray — atom type array.
+        step_scale : float — perturbation magnitude.
+        side : str — label for logging.
+
+        Returns
+        -------
+        PallasAtom — new minimum (or current if step failed).
+        """
+        cfg = self.config
+
+        # Step 1: FP gradient mode (direction toward target in FP space)
+        mode = self._fp_gradient_mode(current, target_fp)
+
+        # Step 2+3: Perturb along mode, run dimer with this mode
+        saddle = None
+        for attempt in range(cfg.max_retries + 1):
+            try:
+                scale = step_scale * (0.5 ** attempt)  # halve on retry
+                saddle = self._fp_guided_saddle(current, mode, scale)
+                break
+            except Exception as e:
+                if attempt < cfg.max_retries:
+                    print(f"  [{side}] Saddle attempt {attempt+1} failed "
+                          f"(scale={scale:.3f}): {e}, retrying...")
+                else:
+                    print(f"  [{side}] All saddle attempts failed: {e}")
+                    return current
+
+        # Register saddle
+        sad_id, _ = self._update_saddle(saddle)
+        saddle.id = sad_id
+        h_sad = (saddle.get_volume() * cfg.press * GPa
+                 + saddle.get_potential_energy() - self.baseenergy)
+        self.G.add_node(sad_id, xname=f'S{sad_id}', e=h_sad,
+                        volume=saddle.get_volume())
+
+        # Edge: current → saddle
+        fp_c = current.get_fp()
+        fp_s = saddle.get_fp()
+        d_cs = fp_distance(fp_c, fp_s, types)
+        h_cur = self.G.nodes[current.id]['e']
+        self.G.add_edge(current.id, sad_id,
+                        weight=max(h_cur, h_sad), dist=d_cs)
+
+        # Step 4: Validate saddle energy
+        if h_sad < h_cur:
+            print(f"  [{side}] WARNING: saddle S{sad_id} ({h_sad:.3f}) "
+                  f"< current M{current.id} ({h_cur:.3f})")
+
+        # Step 5: Escape saddle along dimer mode toward target, then bias
+        escaped = self._saddle_escape(saddle, target_fp)
+
+        # Step 6: Optimize on real PES
+        new_min = local_optimization(escaped, fmax=cfg.opt_fmax,
+                                     steps=cfg.opt_steps)
+        min_id, _ = self._update_minima(new_min)
+        new_min.id = min_id
+
+        h_min = (new_min.get_volume() * cfg.press * GPa
+                 + new_min.get_potential_energy() - self.baseenergy)
+        self.G.add_node(min_id, xname=f'M{min_id}', e=h_min,
+                        volume=new_min.get_volume())
+
+        # Edge: saddle → new minimum
+        fp_m = new_min.get_fp()
+        d_sm = fp_distance(fp_s, fp_m, types)
+        self.G.add_edge(sad_id, min_id,
+                        weight=max(h_sad, h_min), dist=d_sm)
+
+        # Progress report
+        d_target = fp_distance(fp_m, target_fp, types)
+        print(f"  [{side}] S{sad_id} ({h_sad:.3f}) → M{min_id} ({h_min:.3f}) "
+              f"| d(→target)={d_target:.5f}")
+        return new_min
+
+    def _fp_gradient_mode(self, structure, target_fp):
+        """Compute normalized mode pointing toward target in FP space.
+
+        Uses XCalculator to get forces (position gradient) and stress
+        (cell gradient) of the FP distance, then assembles them into
+        a (natom+3, 3) dimer-compatible mode vector.
+
+        Parameters
+        ----------
+        structure : PallasAtom
+        target_fp : np.ndarray, shape (nat, fp_dim)
+
+        Returns
+        -------
+        np.ndarray, shape (natom+3, 3) — normalized mode.
+        """
+        atoms = structure.copy()
+        calc = XCalculator(
+            fp0=target_fp, znucl=self.config.znucl,
+            cutoff=self.config.fpcutoff, natx=self.config.natx)
+        atoms.calc = calc
+
+        forces = atoms.get_forces()      # (natom, 3)
+        stress = atoms.get_stress()      # (6,) Voigt
+
+        natom = len(atoms)
+        vol = atoms.get_volume()
+        jacob = (vol / natom) ** (1.0 / 3.0) * natom ** 0.5
+
+        # Voigt → 3x3 strain gradient
+        # stress_voigt = (1/V) * dE/d(epsilon)
+        # Cell descent direction: -dE/d(epsilon) = -V * stress_3x3
+        stress_3x3 = np.zeros((3, 3))
+        stress_3x3[0, 0] = stress[0]
+        stress_3x3[1, 1] = stress[1]
+        stress_3x3[2, 2] = stress[2]
+        stress_3x3[1, 2] = stress_3x3[2, 1] = stress[3]
+        stress_3x3[0, 2] = stress_3x3[2, 0] = stress[4]
+        stress_3x3[0, 1] = stress_3x3[1, 0] = stress[5]
+
+        mode = np.zeros((natom + 3, 3))
+        mode[:natom] = forces                           # position direction
+        mode[-3:] = -jacob * vol * stress_3x3           # cell direction
+
+        # Constrain redundant freedoms
+        mode[0] *= 0
+        mode[-3, 1:] *= 0
+        mode[-2, 2] *= 0
+
+        return vunit(mode)
+
+    def _fp_guided_saddle(self, structure, mode, step_scale):
+        """Perturb along FP gradient, then find saddle with aligned dimer.
+
+        Parameters
+        ----------
+        structure : PallasAtom — starting minimum.
+        mode : np.ndarray — FP gradient mode (natom+3, 3).
+        step_scale : float — perturbation magnitude.
+
+        Returns
+        -------
+        PallasAtom — saddle point.
+        """
+        atoms = cp(structure)
+        natom = len(atoms)
+        vol = atoms.get_volume()
+        jacob = (vol / natom) ** (1.0 / 3.0) * natom ** 0.5
+
+        # Perturb along FP gradient direction
+        scaled = mode * step_scale
+        cellt = atoms.get_cell() + np.dot(atoms.get_cell(), scaled[-3:] / jacob)
+        atoms.set_cell(cellt, scale_atoms=True)
+        atoms.set_positions(atoms.get_positions() + scaled[:-3])
+        atoms.invalidate_fp()
+
+        # Run dimer with FP gradient as initial mode (structure already perturbed)
+        cfg = self.config
+        return cal_saddle(atoms, fmax=cfg.saddle_fmax, steps=cfg.saddle_steps,
+                          mode=mode)
+
+    def _saddle_escape(self, saddle, target_fp):
+        """Escape saddle toward target using dimer mode + XCalculator bias.
+
+        Two-step descent:
+        1. Push along the dimer's unstable mode in the direction toward target
+           (this crosses the saddle barrier into the next basin)
+        2. Run XCalculator bias to drive further toward target in FP space
+
+        Parameters
+        ----------
+        saddle : PallasAtom — saddle point with .dimer_mode attribute.
+        target_fp : np.ndarray — target fingerprints.
+
+        Returns
+        -------
+        PallasAtom — structure on the target side of the saddle.
+        """
+        atoms = cp(saddle)
+        natom = len(atoms)
+        vol = atoms.get_volume()
+        jacob = (vol / natom) ** (1.0 / 3.0) * natom ** 0.5
+
+        # Get dimer's unstable mode
+        dimer_mode = getattr(saddle, 'dimer_mode', None)
+        if dimer_mode is None:
+            # Fallback: use FP gradient
+            dimer_mode = self._fp_gradient_mode(saddle, target_fp)
+
+        # Determine which direction along the dimer mode leads toward target:
+        # project FP gradient onto dimer mode
+        fp_mode = self._fp_gradient_mode(saddle, target_fp)
+        dot = np.vdot(dimer_mode, fp_mode)
+        push_dir = vunit(dimer_mode) * np.sign(dot) if abs(dot) > 1e-12 \
+            else vunit(fp_mode)
+
+        # Step 1: Push along dimer mode (larger step to cross the saddle)
+        push_scale = self.config.fp_push_scale * 3.0  # stronger than FP push
+        scaled = push_dir * push_scale
+        cellt = atoms.get_cell() + np.dot(atoms.get_cell(), scaled[-3:] / jacob)
+        atoms.set_cell(cellt, scale_atoms=True)
+        atoms.set_positions(atoms.get_positions() + scaled[:-3])
+
+        # Step 2: XCalculator bias toward target (proven to work)
+        calc = XCalculator(
+            fp0=target_fp, znucl=self.config.znucl,
+            cutoff=self.config.fpcutoff, natx=self.config.natx)
+        atoms.calc = calc
+        af = FrechetCellFilter(atoms)
+        opt = FIRE(af, maxstep=0.1, logfile='xcal_escape.log')
+        opt.run(fmax=0.01, steps=self.config.bias_steps)
+
+        if hasattr(atoms, 'invalidate_fp'):
+            atoms.invalidate_fp()
+        return atoms
+
+    def _fp_guided_push(self, saddle, target_fp):
+        """Small FP-guided push on saddle toward target.
+
+        Parameters
+        ----------
+        saddle : PallasAtom — saddle point structure.
+        target_fp : np.ndarray — target fingerprint.
+
+        Returns
+        -------
+        PallasAtom — slightly displaced structure.
+        """
+        mode = self._fp_gradient_mode(saddle, target_fp)
+        atoms = cp(saddle)
+        natom = len(atoms)
+        vol = atoms.get_volume()
+        jacob = (vol / natom) ** (1.0 / 3.0) * natom ** 0.5
+
+        scaled = mode * self.config.fp_push_scale
+        cellt = atoms.get_cell() + np.dot(atoms.get_cell(), scaled[-3:] / jacob)
+        atoms.set_cell(cellt, scale_atoms=True)
+        atoms.set_positions(atoms.get_positions() + scaled[:-3])
+        atoms.invalidate_fp()
+        return atoms
+
     # ── Database / deduplication ──────────────────────────────────────
 
     def _update_minima(self, minima):
@@ -718,15 +1056,14 @@ def listpath(graph_file='graph.pkl', db_file='pallas.db',
 # ── Entry points ──────────────────────────────────────────────────────
 
 def main():
-    """Default run: read POSCAR1/POSCAR2, run PSO search."""
+    """Default run: read POSCAR1/POSCAR2, run FP-guided search."""
     config = PallasConfig()
-    # Read first POSCAR to infer znucl
     atoms = read('POSCAR1', format='vasp')
     config.znucl = sorted(set(atoms.get_atomic_numbers().tolist()))
 
     pallas = Pallas(config)
     pallas.init_run(['POSCAR1', 'POSCAR2'])
-    pallas.run_pso()
+    pallas.run_fp_guided()
 
 
 if __name__ == "__main__":

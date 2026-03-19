@@ -79,15 +79,19 @@ def local_optimization(patoms, fmax=0.001, steps=2000, calc=None):
     return atoms
 
 
-def cal_saddle(patoms, fmax=0.01, steps=2000, calc=None):
+def cal_saddle(patoms, fmax=0.01, steps=2000, calc=None, mode=None):
     """Find saddle point using solid-state dimer method.
 
     Parameters
     ----------
-    patoms : Atoms — starting structure.
+    patoms : Atoms — starting structure (already perturbed if mode given).
     fmax : float — force convergence threshold.
     steps : int — max dimer steps.
     calc : Calculator, optional — override default MatterSim.
+    mode : np.ndarray, optional — initial dimer mode (natom+3, 3).
+        If None, a random mode is generated and the structure is perturbed
+        along it. If provided, the structure is assumed already perturbed
+        and only the dimer search is run with this mode.
 
     Returns
     -------
@@ -100,18 +104,17 @@ def cal_saddle(patoms, fmax=0.01, steps=2000, calc=None):
     vol = atoms.get_volume()
     jacob = (vol / natom) ** (1.0 / 3.0) * natom ** 0.5
 
-    # Random initial mode
-    mode = vrand(np.zeros((natom + 3, 3)))
-    # Constrain redundant freedoms
-    mode[0] *= 0
-    mode[-3, 1:] *= 0
-    mode[-2, 2] *= 0
-    mode = vunit(mode)
+    if mode is None:
+        # Random initial mode + displacement
+        mode = vrand(np.zeros((natom + 3, 3)))
+        mode[0] *= 0
+        mode[-3, 1:] *= 0
+        mode[-2, 2] *= 0
+        mode = vunit(mode)
 
-    # Displace along mode
-    cellt = atoms.get_cell() + np.dot(atoms.get_cell(), mode[-3:] / jacob)
-    atoms.set_cell(cellt, scale_atoms=True)
-    atoms.set_positions(atoms.get_positions() + mode[:-3])
+        cellt = atoms.get_cell() + np.dot(atoms.get_cell(), mode[-3:] / jacob)
+        atoms.set_cell(cellt, scale_atoms=True)
+        atoms.set_positions(atoms.get_positions() + mode[:-3])
 
     # Run dimer search
     d = SolidStateDimer(atoms, mode=mode)
@@ -122,6 +125,10 @@ def cal_saddle(patoms, fmax=0.01, steps=2000, calc=None):
     atoms.converged = actual_fmax <= fmax
     if not atoms.converged:
         print(f"Warning: dimer did not converge (fmax={actual_fmax:.4f})")
+
+    # Store dimer's final mode (unstable direction) and curvature on atoms
+    atoms.dimer_mode = d.mode.copy()
+    atoms.dimer_curvature = d.curvature
 
     new_cell = lower_triangular_cell(atoms)
     atoms.set_cell(new_cell, scale_atoms=True)
