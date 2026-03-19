@@ -661,6 +661,69 @@ class SolidStateDimer:
         else:
             return self.num_atoms
 
+    # ── Built-in QuickMin search (ported from TSASE) ────────────────────
+    # FIRE gets stuck when forces are near-zero at minima because it
+    # resets velocity. The TSASE QuickMin maintains momentum and keeps
+    # the dimer moving even through low-force regions.
+
+    def search(self, fmax=0.01, max_force_calls=100000, quiet=True):
+        """Run dimer search using TSASE's QuickMin translation.
+
+        Unlike FIRE, this keeps velocity-based momentum through
+        low-force regions and requires negative curvature to converge.
+
+        Parameters
+        ----------
+        fmax : float — force convergence threshold.
+        max_force_calls : int — maximum number of force evaluations.
+        quiet : bool — suppress per-step output.
+        """
+        if self.solid_state:
+            V = np.zeros((self.num_atoms + 3, 3))
+        else:
+            V = np.zeros((self.num_atoms, 3))
+
+        self.converged_flag = False
+        step_count = 0
+
+        while self.force_evaluations < max_force_calls:
+            step_count += 1
+            Ftrans = self.get_forces()
+
+            # QuickMin velocity update
+            dV = Ftrans * self.time_step
+            if np.vdot(V, Ftrans) > 0:
+                V = dV * (1.0 + np.vdot(dV, V) / max(np.vdot(dV, dV), EPSILON))
+            else:
+                V = dV
+
+            # Step with max_step clipping
+            step = V * self.time_step
+            step_mag = self._vector_magnitude(step)
+            if step_mag > self.max_step:
+                step = self.max_step * step / step_mag
+
+            self.set_positions(self.get_positions() + step)
+
+            # Convergence check (TSASE-style: fmax AND negative curvature)
+            max_force = max(self._vector_magnitude(Ftrans[i])
+                            for i in range(len(Ftrans)))
+            curv = self.curvature if self.curvature is not None else 1.0
+
+            if not quiet and (step_count % 50 == 0 or step_count == 1):
+                E = self.atoms.get_potential_energy()
+                print(f"  dimer step {step_count}: fmax={max_force:.6f}, "
+                      f"κ={curv:.4f}, E={E:.4f}")
+
+            if max_force < fmax and curv < 0:
+                self.converged_flag = True
+                break
+
+        if not quiet:
+            status = "converged" if self.converged_flag else "not converged"
+            print(f"  dimer {status} after {step_count} steps "
+                  f"({self.force_evaluations} force calls)")
+
     # ── ASE Optimizable protocol ──────────────────────────────────────
     # These methods let ASE's FIRE/BFGS use the dimer's own get_forces
     # and set_positions (with cell DOFs), instead of bypassing to the

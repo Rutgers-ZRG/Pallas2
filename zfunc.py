@@ -89,19 +89,23 @@ def local_optimization(patoms, fmax=0.001, steps=2000, calc=None):
     return atoms
 
 
-def cal_saddle(patoms, fmax=0.01, steps=2000, calc=None, mode=None):
+def cal_saddle(patoms, fmax=0.01, steps=2000, calc=None, mode=None,
+               optimizer='quickmin'):
     """Find saddle point using solid-state dimer method.
 
     Parameters
     ----------
     patoms : Atoms — starting structure (already perturbed if mode given).
     fmax : float — force convergence threshold.
-    steps : int — max dimer steps.
+    steps : int — max steps (FIRE) or max force calls / 3 (quickmin).
     calc : Calculator, optional — override default MatterSim.
     mode : np.ndarray, optional — initial dimer mode (natom+3, 3).
         If None, a random mode is generated and the structure is perturbed
         along it. If provided, the structure is assumed already perturbed
         and only the dimer search is run with this mode.
+    optimizer : str — 'quickmin' (TSASE-style, default) or 'fire'.
+        quickmin maintains momentum through low-force regions and requires
+        negative curvature for convergence. fire may get stuck at minima.
 
     Returns
     -------
@@ -126,23 +130,22 @@ def cal_saddle(patoms, fmax=0.01, steps=2000, calc=None, mode=None):
         atoms.set_cell(cellt, scale_atoms=True)
         atoms.set_positions(atoms.get_positions() + mode[:-3])
 
-    # Run dimer search
-    # maxstep=0.02: conservative to avoid overshooting saddle region
-    # dimer_separation=0.005: robust curvature estimate
     d = SolidStateDimer(atoms, mode=mode, dimer_separation=0.005)
-    dyn = FIRE(d, maxstep=0.02, logfile=None)
-    dyn.run(fmax=fmax, steps=steps)
 
-    actual_fmax = np.max(np.abs(atoms.get_forces()))
-    atoms.converged = actual_fmax <= fmax
-    if not atoms.converged:
-        print(f"Warning: dimer did not converge (fmax={actual_fmax:.4f})")
+    if optimizer == 'quickmin':
+        # TSASE-style: momentum-based, requires negative curvature
+        d.search(fmax=fmax, max_force_calls=steps * 3, quiet=False)
+        atoms.converged = getattr(d, 'converged_flag', False)
+    else:
+        # ASE FIRE
+        dyn = FIRE(d, maxstep=0.1, logfile='ssdimer.log')
+        dyn.run(fmax=fmax, steps=steps)
+        d.get_forces()  # capture curvature (ASE wrapper workaround)
+        actual_fmax = np.max(np.abs(atoms.get_forces()))
+        atoms.converged = (actual_fmax <= fmax
+                           and d.curvature is not None
+                           and d.curvature < 0)
 
-    # Capture final dimer mode and curvature.
-    # ASE's OptimizableAtoms wrapper bypasses the dimer's get_forces
-    # (via __getattr__ → inner atoms), so d.curvature may be stale.
-    # One extra get_forces call ensures curvature is up-to-date.
-    d.get_forces()
     atoms.dimer_mode = d.mode.copy()
     atoms.dimer_curvature = d.curvature
 
