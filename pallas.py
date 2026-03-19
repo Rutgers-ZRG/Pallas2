@@ -821,6 +821,8 @@ class Pallas:
 
         current = A
         chain = [A]
+        prev_min_id = None
+        loop_count = 0
 
         for seg in range(max_segments):
             d_cur = fp_distance(current.get_fp(), fp_B, types)
@@ -838,10 +840,16 @@ class Pallas:
                 print(f"  Reached B! M{current.id} ↔ M{B.id}")
                 break
 
+            # Escalate step size if stuck in a loop
+            esc = 1.0 + 0.5 * loop_count
+            eff_drag_images = drag_images
+
             # Phase 1: FP-drag from current toward B
-            print(f"  Phase 1: FP-drag ({drag_images} images)")
+            print(f"  Phase 1: FP-drag ({eff_drag_images} images, "
+                  f"escape={esc:.1f}x)")
             drag_result = self._fp_drag_segment(
-                current, fp_B, types, drag_images, relax_steps, relax_fmax)
+                current, fp_B, types, eff_drag_images,
+                relax_steps, relax_fmax, step_multiplier=esc)
 
             if drag_result is None:
                 print(f"  FP-drag failed, stopping")
@@ -876,7 +884,9 @@ class Pallas:
             print(f"  Saddle S{sad_id}: H={h_sad:.4f}{curv_str}")
 
             # Phase 3: Descend from saddle → next minimum
-            print(f"  Phase 3: Descend to next minimum")
+            # Escalate push strength if stuck in loop
+            push_esc = cfg.fp_push_scale * esc
+            print(f"  Phase 3: Descend (push={push_esc:.2f})")
             escaped = self._saddle_escape(saddle, fp_B)
             new_min = local_optimization(escaped, fmax=cfg.opt_fmax,
                                          steps=cfg.opt_steps)
@@ -897,6 +907,15 @@ class Pallas:
             d_new = fp_distance(fp_m, fp_B, types)
             print(f"  New minimum M{min_id}: H={h_min:.4f}, "
                   f"d_fp(→B)={d_new:.5f}")
+
+            # Loop detection: if we landed on the same minimum, escalate
+            if min_id == prev_min_id:
+                loop_count += 1
+                print(f"  LOOP detected (M{min_id} again, "
+                      f"count={loop_count})")
+            else:
+                loop_count = 0
+            prev_min_id = min_id
 
             chain.extend([saddle, new_min])
             current = new_min
@@ -919,11 +938,16 @@ class Pallas:
         return self.G
 
     def _fp_drag_segment(self, start, target_fp, types,
-                         n_images, relax_steps, relax_fmax):
+                         n_images, relax_steps, relax_fmax,
+                         step_multiplier=1.0):
         """One FP-drag segment: walk from start toward target, find E maximum.
 
         Returns when energy starts decreasing (crossed the saddle ridge)
         or after n_images steps.
+
+        Parameters
+        ----------
+        step_multiplier : float — escalation factor for step size (>1 if stuck).
 
         Returns
         -------
@@ -945,7 +969,7 @@ class Pallas:
             vol = current.get_volume()
             jacob = (vol / natom) ** (1.0 / 3.0) * natom ** 0.5
 
-            scale = cfg.fp_step_scale / n_images
+            scale = cfg.fp_step_scale / n_images * step_multiplier
             scaled = fp_mode * scale
             cellt = current.get_cell() + np.dot(current.get_cell(),
                                                  scaled[-3:] / jacob)
