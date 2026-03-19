@@ -28,7 +28,7 @@ import ase.db
 import torch
 import torch_fplib
 from xcal import XCalculator, atoms_to_cell, fp_dist_with_assignment
-from zfunc import local_optimization, cal_saddle, vunit, vrand
+from zfunc import local_optimization, cal_saddle, vunit, vrand, _get_calculator
 from barrier import minimax_path
 
 
@@ -567,6 +567,207 @@ class Pallas:
         af = FrechetCellFilter(atoms)
         opt = FIRE(af, maxstep=0.1, logfile='xcal.log')
         opt.run(fmax=0.01, steps=self.config.bias_steps)
+        return atoms
+
+    # ── FP-drag: constrained walk along FP coordinate ───────────────
+
+    def run_fp_drag(self, n_images=20, relax_steps=30, relax_fmax=0.05):
+        """Drag structure from A to B along the FP distance coordinate.
+
+        At each image:
+        1. Take a step along the FP gradient (decrease d_fp toward B)
+        2. Relax perpendicular DOFs on the real PES (constrained relaxation)
+        3. Record the PES energy
+
+        The energy maximum along the path is the approximate saddle.
+        Optionally followed by dimer refinement at the maximum.
+
+        Parameters
+        ----------
+        n_images : int — number of intermediate images.
+        relax_steps : int — perpendicular relaxation steps per image.
+        relax_fmax : float — force threshold for perpendicular relaxation.
+
+        Returns
+        -------
+        dict with keys:
+            images : list of PallasAtom
+            energies : list of float (PES enthalpy)
+            fp_dists : list of float (FP distance to B)
+            barrier : float (max energy - min(E_A, E_B))
+            saddle_idx : int (index of approximate saddle)
+        """
+        cfg = self.config
+        print(f"FP-drag: {n_images} images, relax_steps={relax_steps}")
+
+        # Optimize endpoints
+        A = self._optimize_and_register(self.reactant, is_base=True)
+        B = self._optimize_and_register(self.product, is_base=False)
+        types = self._get_types(A)
+        fp_B = B.get_fp()
+
+        d0 = fp_distance(A.get_fp(), fp_B, types)
+        h_A = 0.0
+        h_B = (B.get_volume() * cfg.press * GPa
+               + B.get_potential_energy() - self.baseenergy)
+
+        print(f"  A: H={h_A:.4f} eV, B: H={h_B:.4f} eV, d_fp={d0:.5f}")
+
+        current = cp(A)
+        images = [cp(A)]
+        enthalpies = [h_A]
+        fp_dists = [d0]
+
+        for i in range(n_images):
+            # Step size: adaptive (equal steps in FP distance)
+            d_current = fp_distance(current.get_fp(), fp_B, types)
+            target_step = d0 / n_images
+
+            # 1. FP gradient step toward B
+            fp_mode = self._fp_gradient_mode(current, fp_B)
+            natom = len(current)
+            vol = current.get_volume()
+            jacob = (vol / natom) ** (1.0 / 3.0) * natom ** 0.5
+
+            # Scale: step in FP space ≈ target_step
+            # Use a fixed geometric step in configuration space
+            scale = cfg.fp_step_scale / n_images * 5.0
+            scaled = fp_mode * scale
+            cellt = current.get_cell() + np.dot(current.get_cell(),
+                                                 scaled[-3:] / jacob)
+            current.set_cell(cellt, scale_atoms=True)
+            current.set_positions(current.get_positions() + scaled[:-3])
+            if hasattr(current, 'invalidate_fp'):
+                current.invalidate_fp()
+
+            # 2. Perpendicular relaxation on real PES
+            if relax_steps > 0:
+                current = self._perpendicular_relax(
+                    current, fp_B, types, relax_steps, relax_fmax)
+
+            # 3. Record
+            h = (current.get_volume() * cfg.press * GPa
+                 + current.get_potential_energy() - self.baseenergy)
+            d = fp_distance(current.get_fp(), fp_B, types)
+            enthalpies.append(h)
+            fp_dists.append(d)
+            images.append(cp(current))
+
+            progress = 1.0 - d / max(d0, 1e-10)
+            print(f"  image {i+1}/{n_images}: H={h:.4f} eV, "
+                  f"d_fp={d:.5f}, progress={progress:.1%}")
+
+        # Find approximate saddle (energy maximum)
+        saddle_idx = int(np.argmax(enthalpies))
+        barrier = enthalpies[saddle_idx] - min(h_A, h_B)
+
+        print(f"\nFP-drag complete:")
+        print(f"  Barrier ≈ {barrier:.4f} eV ({barrier/4:.4f} eV/f.u.)")
+        print(f"  Saddle at image {saddle_idx}/{n_images} "
+              f"(H={enthalpies[saddle_idx]:.4f})")
+        print(f"  FP progress: {fp_dists[0]:.5f} → {fp_dists[-1]:.5f}")
+
+        # Register saddle structure in graph
+        if saddle_idx > 0 and saddle_idx < len(images) - 1:
+            saddle_struct = images[saddle_idx]
+            sad_id, _ = self._update_saddle(saddle_struct)
+            saddle_struct.id = sad_id
+            self.G.add_node(sad_id, xname=f'S{sad_id}',
+                            e=enthalpies[saddle_idx],
+                            volume=saddle_struct.get_volume())
+
+            # Edges to nearest minima in the path
+            A_id = self.init_minima[0].id
+            B_id = self.init_minima[1].id
+            self.G.add_edge(A_id, sad_id,
+                            weight=max(h_A, enthalpies[saddle_idx]),
+                            dist=fp_dists[saddle_idx])
+            self.G.add_edge(sad_id, B_id,
+                            weight=max(enthalpies[saddle_idx], h_B),
+                            dist=fp_dists[saddle_idx])
+            self._save_state()
+
+        return {
+            'images': images,
+            'energies': enthalpies,
+            'fp_dists': fp_dists,
+            'barrier': barrier,
+            'saddle_idx': saddle_idx,
+        }
+
+    def _perpendicular_relax(self, structure, target_fp, types,
+                             n_steps, fmax_tol):
+        """Relax on real PES with FP-gradient component projected out.
+
+        This keeps the structure at approximately the same FP distance
+        from the target while minimizing the PES energy.
+
+        Parameters
+        ----------
+        structure : PallasAtom
+        target_fp : np.ndarray — target fingerprints.
+        types : np.ndarray
+        n_steps : int — max relaxation steps.
+        fmax_tol : float — perpendicular force convergence.
+
+        Returns
+        -------
+        PallasAtom — relaxed structure.
+        """
+        atoms = structure
+        atoms.calc = _get_calculator()
+
+        # FP gradient direction (unit vector in generalized space)
+        fp_dir = self._fp_gradient_mode(atoms, target_fp)
+
+        natom = len(atoms)
+        vol = atoms.get_volume()
+        jacob = (vol / natom) ** (1.0 / 3.0) * natom ** 0.5
+
+        for step in range(n_steps):
+            forces = atoms.get_forces()
+            stress = atoms.get_stress()
+
+            # Build generalized force (natom+3, 3)
+            gen_force = np.zeros((natom + 3, 3))
+            gen_force[:natom] = forces
+
+            # Stress → cell force (same as dimer convention)
+            volume = -atoms.get_volume()
+            st = np.zeros((3, 3))
+            st[0, 0] = stress[0] * volume
+            st[1, 1] = stress[1] * volume
+            st[2, 2] = stress[2] * volume
+            st[2, 1] = stress[3] * volume
+            st[2, 0] = stress[4] * volume
+            st[1, 0] = stress[5] * volume
+            gen_force[-3:] = st / jacob
+
+            # Project out FP gradient component
+            proj = np.vdot(gen_force, fp_dir)
+            gen_force -= proj * fp_dir
+
+            # Check convergence
+            per_row = np.array([np.linalg.norm(gen_force[i])
+                                for i in range(natom + 3)])
+            if per_row.max() < fmax_tol:
+                break
+
+            # Steepest descent step (conservative)
+            step_size = 0.02
+            step_vec = gen_force * step_size
+            mag = np.sqrt(np.vdot(step_vec, step_vec))
+            if mag > 0.1:
+                step_vec *= 0.1 / mag
+
+            # Apply
+            cellt = atoms.get_cell() + np.dot(atoms.get_cell(),
+                                               step_vec[-3:] / jacob)
+            atoms.set_cell(cellt, scale_atoms=True)
+            atoms.set_positions(atoms.get_positions() + step_vec[:-3])
+
+        if hasattr(atoms, 'invalidate_fp'):
+            atoms.invalidate_fp()
         return atoms
 
     # ── FP-guided chain-growing search ────────────────────────────────
