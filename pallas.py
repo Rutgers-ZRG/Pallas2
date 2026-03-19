@@ -1,48 +1,160 @@
-import sys
+"""PALLAS — Phase Transition Pathway Sampling via Swarm Intelligence and Graph Theory.
+
+Automated method for finding transition pathways between crystal phases using:
+- Bidirectional PSO search with fingerprint-guided bias
+- Solid-state dimer method for saddle point location
+- NetworkX graph with minimax bottleneck path finding
+- torch_fplib GOM fingerprints for structural distance
+
+Dependencies: torch_fplib, MatterSim (via zfunc), ASE, NetworkX.
+"""
+
 import os
-import socket
+import sys
 from copy import deepcopy as cp
+from dataclasses import dataclass, field
+
 import numpy as np
-from ase import Atoms
-from ase.io import read, write
-import ase.db
 import networkx as nx
 import joblib
-import random
-import matplotlib.pyplot as plt
-from matplotlib.animation import FuncAnimation
-import libfp
-import time
-from ase.units import GPa
-
+from ase import Atoms
+from ase.io import read, write
 from ase.optimize import FIRE
-# from ase.constraints import StrainFilter, UnitCellFilter
 from ase.filters import FrechetCellFilter
+from ase.units import GPa
+import ase.db
 
-from xcal import XCalculator
-
+import torch
+import torch_fplib
+from xcal import XCalculator, atoms_to_cell
 from zfunc import local_optimization, cal_saddle, vunit, vrand
+from barrier import minimax_path
 
-class Pallas(object):
-    def __init__(self):
+
+# ── Configuration ─────────────────────────────────────────────────────
+
+@dataclass
+class PallasConfig:
+    """Configuration for PALLAS pathway search."""
+    # Fingerprint parameters
+    fpcutoff: float = 5.5
+    natx: int = 200
+    lmax: int = 0       # 0 = s-only, 1 = s+p
+
+    # System
+    znucl: list = field(default_factory=list)   # atomic numbers in type order
+    press: float = 0.0                          # external pressure (eV/Å³)
+
+    # PSO parameters
+    maxstep: int = 50
+    popsize: int = 10
+    velocity_weight: float = 0.9
+    c1: float = 2.0     # personal best weight
+    c2: float = 1.5     # global best weight
+
+    # Optimization step limits
+    opt_steps: int = 2000           # max FIRE steps for local optimization
+    opt_fmax: float = 0.001         # force convergence for optimization
+    saddle_steps: int = 2000        # max FIRE steps for dimer saddle search
+    saddle_fmax: float = 0.01       # force convergence for saddle
+    bias_steps: int = 60            # max FIRE steps for FP bias relaxation
+
+    # Convergence
+    ediff: float = 0.001            # energy diff threshold for same structure
+    dist_threshold: float = 0.01    # FP distance threshold for connection
+
+
+# ── PallasAtom: Atoms with fingerprint caching ────────────────────────
+
+class PallasAtom(Atoms):
+    """ASE Atoms subclass with cached fingerprints and metadata.
+
+    Fingerprints are computed via torch_fplib and cached until invalidated.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.natx = 200
+        self.fpcutoff = 5.5
+        self.fp = None
+        self.converged = False
+        self.id = None
+        self._znucl = None
+
+    @property
+    def znucl(self):
+        return self._znucl
+
+    @znucl.setter
+    def znucl(self, val):
+        self._znucl = list(val) if val is not None else None
+
+    def get_fp(self):
+        """Return cached fingerprints, computing if needed."""
+        if self.fp is None:
+            self.fp = self.cal_fp()
+        return self.fp
+
+    def cal_fp(self):
+        """Compute GOM fingerprints via torch_fplib."""
+        if self._znucl is None or len(self._znucl) == 0:
+            raise ValueError("znucl not set on PallasAtom")
+        lat_np, rxyz_np, types, znucl = atoms_to_cell(self, self._znucl)
+        with torch.no_grad():
+            fp = torch_fplib.get_lfp(
+                (lat_np, rxyz_np, types, znucl),
+                cutoff=self.fpcutoff, natx=self.natx, orbital='s'
+            )
+        return fp.numpy()
+
+    def invalidate_fp(self):
+        """Clear cached fingerprint (call after position/cell changes)."""
+        self.fp = None
+
+
+# ── Fingerprint distance helper ───────────────────────────────────────
+
+def fp_distance(fp1, fp2, types):
+    """Hungarian-matched fingerprint distance between two structures.
+
+    Parameters
+    ----------
+    fp1, fp2 : np.ndarray, shape (nat, fp_dim)
+    types : array-like, shape (nat,)  — 1-indexed atom types.
+
+    Returns
+    -------
+    float — averaged FP distance.
+    """
+    fp1 = np.asarray(fp1)
+    fp2 = np.asarray(fp2)
+    return torch_fplib.get_fp_dist(fp1, fp2, np.asarray(types))
+
+
+# ── Main PALLAS class ────────────────────────────────────────────────
+
+class Pallas:
+    """PALLAS bidirectional PSO pathway search engine.
+
+    Usage::
+
+        config = PallasConfig(znucl=[6], press=10.0)
+        pallas = Pallas(config)
+        pallas.init_run(['POSCAR_graphite', 'POSCAR_diamond'])
+        graph = pallas.run_pso()
+    """
+
+    def __init__(self, config=None):
+        self.config = config or PallasConfig()
         self.init_minima = []
-        self.ipso = []
         self.all_minima = []
         self.all_saddle = []
-        self.fpcutoff = 5.5
-        self.lmax = 0
-        self.natx = 200
-        self.ntyp = None
-        self.znucl = None
-        self.types = None # np.array([1,1,1,1,2,2,2,2])
-        self.dij = np.zeros((10000, 10000), float)
+        self.dij = {}                # sparse: (id1, id2) → fp_dist
         self.baseenergy = 0.0
         self.G = nx.Graph()
-        self.press = 0.0
-        self.maxstep = 50
-        self.popsize = 10
-        
-        # PSO parameters
+        self.db = None
+
+        # PSO state
         self.pbestx = []
         self.pbesty = []
         self.gbestx = None
@@ -50,1071 +162,572 @@ class Pallas(object):
         self.pdistx = []
         self.pdisty = []
         self.bestdist = float('inf')
-        self.bestmdist = float('inf')
-        self.ediff = 0.001
-        self.dist_threshold = 0.01
-        self.velocity_weight = 0.9
-        self.c1 = 2.0  # Personal best weight
-        self.c2 = 1.5  # Global best weight
-        
+
+    # ── Distance matrix (sparse dict) ────────────────────────────────
+
+    def update_dij(self, id1, id2, fp_dist):
+        """Store symmetric FP distance."""
+        key = (min(id1, id2), max(id1, id2))
+        self.dij[key] = fp_dist
+
+    def get_dij(self, id1, id2):
+        """Retrieve FP distance (0 for same ID, inf if unknown)."""
+        if id1 == id2:
+            return 0.0
+        key = (min(id1, id2), max(id1, id2))
+        return self.dij.get(key, float('inf'))
+
+    # ── Initialization ───────────────────────────────────────────────
+
+    def _get_types(self, atoms):
+        """Get 1-indexed type array from atoms and config znucl."""
+        numbers = atoms.get_atomic_numbers()
+        return np.array([self.config.znucl.index(z) + 1 for z in numbers])
 
     def init_run(self, flist):
+        """Initialize from POSCAR files.
+
+        Parameters
+        ----------
+        flist : list of str
+            At least 2 POSCAR paths: [reactant, product, ...optional intermediates].
+        """
         if len(flist) < 2:
-            raise ValueError("At least two structures (reactant and product) are required for PSO")
-            
+            raise ValueError("Need at least 2 structures (reactant and product)")
+
         self.db = ase.db.connect('pallas.db')
-        self.dij[:][:] = float('inf')
-        np.fill_diagonal(self.dij, 0.0)
-        
-        # Ensure types and znucl are set properly before we create PallasAtom objects
-        if self.types is None:
-            print("Warning: self.types is None in init_run! This will cause segfaults.")
-        
-        if self.znucl is None:
-            print("Warning: self.znucl is empty in init_run! This may cause problems.")
-        
-        self.init_minima = self.read_init_structure(flist)
-        self.num_init_min = len(self.init_minima)
 
-
-        # Use the first structure as reactant and the second as product
-        self.reactant = self.init_minima[0]
-        self.product = self.init_minima[1]
-        
-        # Double-check the types are set properly
-        for struct in self.init_minima:
-            if struct.types is None:
-                print(f"Warning: types not properly set in structure after initialization")
-                struct.types = self.types
-
-    def read_init_structure(self, flist):
-        init_minima = []
+        self.init_minima = []
         for xf in flist:
             x = read(xf, format='vasp')
-            x = PallasAtom(x)
-            x.fpcutoff = self.fpcutoff
-            x.types = self.types
-            x.znucl = self.znucl
-            init_minima.append(cp(x))
-        return init_minima
-    
-    def run_pso(self):
-        """Main PSO loop to optimize saddle points between reactant and product.
-        
-        This method implements Particle Swarm Optimization (PSO) to find reaction pathways
-        between reactant and product structures. The algorithm works by:
-        
-        1. Starting with populations of perturbed reactant and product structures
-        2. Finding saddle points and local minima from each structure
-        3. Measuring fingerprint distances between structures from opposite sides
-        4. Updating particle velocities based on personal and global best positions
-        5. Searching for connections between reactant and product sides
-        6. Continuing until a pathway is found or maximum iterations are reached
-        
-        The PSO approach has several advantages:
-        - Bidirectional search from both reactant and product sides simultaneously
-        - Optimization for minimum fingerprint distance and energy barriers
-        - "Swarm intelligence" where particles share information about best pathways
-        
-        Returns:
-            networkx.Graph: The final graph representing the energy landscape
-        """
-        print("Starting PSO-based path optimization")
-        
-        # Optimize the reactant and product structures
-        print("Optimizing reactant structure")
-        react_opt = local_optimization(self.reactant)
-        # print (react_opt.calc)
-        react_id, _ = self.update_minima(react_opt)
-        react_opt.id = react_id
-        
-        print("Optimizing product structure")
-        prod_opt = local_optimization(self.product)
-        prod_id, _ = self.update_minima(prod_opt)
-        prod_opt.id = prod_id
-        
-        # Set base energy to reactant energy
-        self.baseenergy = react_opt.get_volume()*self.press*GPa + react_opt.get_potential_energy()
-        
-        # Add reactant and product to graph
-        h_react = 0.0
-        vol_react = react_opt.get_volume()
-        self.G.add_node(react_id, xname=f'M{react_id}', e=h_react, volume=vol_react)
-        
-        h_prod = prod_opt.get_volume()*self.press*GPa + prod_opt.get_potential_energy() - self.baseenergy
-        vol_prod = prod_opt.get_volume()
-        self.G.add_node(prod_id, xname=f'M{prod_id}', e=h_prod, volume=vol_prod)
-        
-        print(f"Added reactant: ID={react_id}, Energy={h_react:.4f}")
-        print(f"Added product: ID={prod_id}, Energy={h_prod:.4f}")
-        
-        # Initialize particles
-        reactant_particles = []
-        product_particles = []
-        reactant_velocities = []
-        product_velocities = []
-        
-        print(f"Initializing {self.popsize} particles for PSO")
-        
-        # Create initial population of perturbed structures and random velocities
-        for i in range(self.popsize):
-            # Create perturbed copies for reactant side
-            perturbed_reactant = self.add_perturbation(react_opt)
-            reactant_particles.append(perturbed_reactant)
-            
-            # Create random velocity for reactant
-            reactant_vel = self.gen_random_velocity(perturbed_reactant)
-            reactant_velocities.append(reactant_vel)
-            
-            # Create perturbed copies for product side
-            perturbed_product = self.add_perturbation(prod_opt)
-            product_particles.append(perturbed_product)
-            
-            # Create random velocity for product
-            product_vel = self.gen_random_velocity(perturbed_product)
-            product_velocities.append(product_vel)
-            
-            # Initialize personal best distances as infinity
-            self.pdistx.append(float('inf'))
-            self.pdisty.append(float('inf'))
-        
-        # Initialize best structures
-        self.pbestx = cp(reactant_particles)
-        self.pbesty = cp(product_particles)
-        
-        # Main PSO iteration loop
-        for step in range(self.maxstep):
-            print(f"PSO iteration {step+1}/{self.maxstep}")
-            
-            reactant_saddles = []
-            product_saddles = []
-            
-            # Calculate saddle points for each particle
-            for i in range(self.popsize):
-                print(f"Processing particle {i+1}/{self.popsize}")
-                
-                # Calculate saddle point from reactant side
-                # try:
-                reactant_saddle = self.calculate_saddle_with_velocity(
-                    reactant_particles[i], 
-                    reactant_velocities[i]
-                )
-                reactant_saddles.append(reactant_saddle)
-                
-                # Update the saddle in database and graph
-                sadr_id, _ = self.update_saddle(reactant_saddle)
-                reactant_saddle.id = sadr_id
-                h = reactant_saddle.get_volume()*self.press*GPa + reactant_saddle.get_potential_energy() - self.baseenergy
-                volume = reactant_saddle.get_volume()
-                
-                # Add node and edge to graph
-                self.G.add_node(sadr_id, xname=f'S{sadr_id}', e=h, volume=volume)
-                # Calculate edge weight (max energy) and add with fingerprint distance
-                react_energy = self.G.nodes[react_id]['e']
-                edge_weight = max(react_energy, h)
-                # Use previous fingerprint distance calculation or calculate new one
-                fp_r = react_opt.get_fp()
-                fp_s = reactant_saddle.get_fp()
-                if self.types is not None:
-                    try:
-                        fp_dist = libfp.get_fp_dist(fp_r, fp_s, self.types)
-                    except Exception as e:
-                        print(f"Error calculating fp_dist for edge: {e}")
-                        fp_dist = float('inf')
-                else:
-                    fp_dist = float('inf')
-                self.G.add_edge(react_id, sadr_id, weight=edge_weight, dist=fp_dist)
-                print(f"Added saddle from reactant: ID={sadr_id}, Energy={h:.4f}")
-                
-                # Find local minimum from this saddle
-                sadxcal = self.xcal(reactant_saddle, prod_opt.get_fp())
-                new_min_r = local_optimization(sadxcal)
-                min_r_id, _ = self.update_minima(new_min_r)
-                new_min_r.id = min_r_id
-                h = new_min_r.get_volume()*self.press*GPa + new_min_r.get_potential_energy() - self.baseenergy
-                volume = new_min_r.get_volume()
-                
-                # Update graph with new minimum
-                self.G.add_node(min_r_id, xname=f'M{min_r_id}', e=h, volume=volume)
-                # Calculate edge weight and add with fingerprint distance
-                saddle_energy = self.G.nodes[sadr_id]['e']
-                edge_weight = max(saddle_energy, h)
-                # Use previous fingerprint distance calculation or calculate new one
-                fp_s = reactant_saddle.get_fp()
-                fp_m = new_min_r.get_fp()
-                if self.types is not None:
-                    try:
-                        fp_dist = libfp.get_fp_dist(fp_s, fp_m, self.types)
-                    except Exception as e:
-                        print(f"Error calculating fp_dist for edge: {e}")
-                        fp_dist = float('inf')
-                else:
-                    fp_dist = float('inf')
-                self.G.add_edge(sadr_id, min_r_id, weight=edge_weight, dist=fp_dist)
-                print(f"Added minimum from reactant saddle: ID={min_r_id}, Energy={h:.4f}")
-                
-                # Update particle position
-                reactant_particles[i] = cp(new_min_r)
+            pa = PallasAtom(x)
+            pa.fpcutoff = self.config.fpcutoff
+            pa.natx = self.config.natx
+            pa.znucl = self.config.znucl
+            self.init_minima.append(pa)
 
-                # except Exception as e:
-                #     print(f"Error calculating reactant saddle for particle {i}: {e}")
-                
-                # Calculate saddle point from product side
-                try:
-                    product_saddle = self.calculate_saddle_with_velocity(
-                        product_particles[i], 
-                        product_velocities[i]
-                    )
-                    product_saddles.append(product_saddle)
-                    
-                    # Update the saddle in database and graph
-                    sadp_id, _ = self.update_saddle(product_saddle)
-                    product_saddle.id = sadp_id
-                    h = product_saddle.get_volume()*self.press*GPa + product_saddle.get_potential_energy() - self.baseenergy
-                    volume = product_saddle.get_volume()
-                    
-                    # Add node and edge to graph
-                    self.G.add_node(sadp_id, xname=f'S{sadp_id}', e=h, volume=volume)
-                    # Calculate edge weight (max energy) and add with fingerprint distance
-                    prod_energy = self.G.nodes[prod_id]['e']
-                    edge_weight = max(prod_energy, h)
-                    # Use previous fingerprint distance calculation or calculate new one
-                    fp_p = prod_opt.get_fp()
-                    fp_s = product_saddle.get_fp()
-                    if self.types is not None:
-                        try:
-                            fp_dist = libfp.get_fp_dist(fp_p, fp_s, self.types)
-                        except Exception as e:
-                            print(f"Error calculating fp_dist for edge: {e}")
-                            fp_dist = float('inf')
-                    else:
-                        fp_dist = float('inf')
-                    self.G.add_edge(prod_id, sadp_id, weight=edge_weight, dist=fp_dist)
-                    print(f"Added saddle from product: ID={sadp_id}, Energy={h:.4f}")
-                    
-                    # Find local minimum from this saddle
-                    sadxcal = self.xcal(product_saddle, react_opt.get_fp())
-                    new_min_p = local_optimization(sadxcal)
-                    min_p_id, _ = self.update_minima(new_min_p)
-                    new_min_p.id = min_p_id
-                    h = new_min_p.get_volume()*self.press*GPa + new_min_p.get_potential_energy() - self.baseenergy
-                    volume = new_min_p.get_volume()
-                    
-                    # Update graph with new minimum
-                    self.G.add_node(min_p_id, xname=f'M{min_p_id}', e=h, volume=volume)
-                    # Calculate edge weight and add with fingerprint distance
-                    saddle_energy = self.G.nodes[sadp_id]['e']
-                    edge_weight = max(saddle_energy, h)
-                    # Use previous fingerprint distance calculation or calculate new one
-                    fp_s = product_saddle.get_fp()
-                    fp_m = new_min_p.get_fp()
-                    if self.types is not None:
-                        try:
-                            fp_dist = libfp.get_fp_dist(fp_s, fp_m, self.types)
-                        except Exception as e:
-                            print(f"Error calculating fp_dist for edge: {e}")
-                            fp_dist = float('inf')
-                    else:
-                        fp_dist = float('inf')
-                    self.G.add_edge(sadp_id, min_p_id, weight=edge_weight, dist=fp_dist)
-                    print(f"Added minimum from product saddle: ID={min_p_id}, Energy={h:.4f}")
-                    
-                    # Update particle position
-                    product_particles[i] = cp(new_min_p)
-                except Exception as e:
-                    print(f"Error calculating product saddle for particle {i}: {e}")
-            
-            # Check fingerprint distances between all minima pairs
-            connection_found = False
-            print("Checking for connections between reactant and product sides")
-            
-            # Get all minima from reactant side
-            minima_from_reactant = []
-            for p in reactant_particles:
-                minima_from_reactant.append(p)
-            
-            # Get all minima from product side
-            minima_from_product = []
-            for p in product_particles:
-                minima_from_product.append(p)
-            
-            # Find closest pairs based on fingerprint distance
-            min_dist = float('inf')
-            best_pair = None
-            
-            for i, min_r in enumerate(minima_from_reactant):
-                for j, min_p in enumerate(minima_from_product):
-                    # Calculate fingerprint distance
-                    fp_r = min_r.get_fp()
-                    fp_p = min_p.get_fp()
-                    
-                    # Make sure types is not None before calling the function
-                    if self.types is None:
-                        print("Warning: self.types is None in fingerprint comparison!")
-                        continue
-                        
-                    try:
-                        # fp_dist = fplib2.get_fpdist(self.ntyp, self.types, fp_r, fp_p)
-                        fp_dist = libfp.get_fp_dist(fp_r, fp_p, self.types)
-                        energy_diff = abs(min_r.get_potential_energy() - min_p.get_potential_energy())
-                        
-                        # Only print if distance is below a threshold or it meets a significant condition
-                        if fp_dist < 0.1:  # Only print "interesting" distances
-                            print(f"FP distance between minima {min_r.id} and {min_p.id}: {fp_dist:.5f}, energy diff: {energy_diff:.5f}")
-                        
-                        # If distance is below threshold and energy difference is small, add edge
-                        if fp_dist < self.dist_threshold and energy_diff < self.ediff:
-                            print(f"Connection found between minima {min_r.id} and {min_p.id}!")
-                            # Calculate edge weight (max energy)
-                            min_r_energy = self.G.nodes[min_r.id]['e'] if min_r.id in self.G.nodes else min_r.get_volume()*self.press*GPa + min_r.get_potential_energy() - self.baseenergy
-                            min_p_energy = self.G.nodes[min_p.id]['e'] if min_p.id in self.G.nodes else min_p.get_volume()*self.press*GPa + min_p.get_potential_energy() - self.baseenergy
-                            edge_weight = max(min_r_energy, min_p_energy)
-                            self.G.add_edge(min_r.id, min_p.id, weight=edge_weight, dist=fp_dist)
-                            connection_found = True
-                        
-                        # Update minimum distance
-                        if fp_dist < min_dist:
-                            min_dist = fp_dist
-                            best_pair = (i, j)
-                    except Exception as e:
-                        print(f"Error calculating distance between minima {min_r.id} and {min_p.id}: {e}")
-                        continue
-            
-            # Update global best if new minimum distance is found
-            if min_dist < self.bestdist:
-                self.bestdist = min_dist
-                self.gbestx = cp(minima_from_reactant[best_pair[0]])
-                self.gbesty = cp(minima_from_product[best_pair[1]])
-                print(f"New global best distance: {min_dist:.5f} between minima {self.gbestx.id} and {self.gbesty.id}")
-            
-            # Update personal bests
-            for i, min_r in enumerate(minima_from_reactant):
-                # Find minimum distance to any product-side minimum
-                best_dist_for_r = float('inf')
-                for min_p in minima_from_product:
-                    fp_r = min_r.get_fp()
-                    fp_p = min_p.get_fp()
-                    
-                    # Make sure types is not None before calling the function
-                    if self.types is None:
-                        print("Warning: self.types is None in personal best update!")
-                        continue
-                    
-                    try:
-                        # fp_dist = fplib2.get_fpdist(self.ntyp, self.types, fp_r, fp_p)
-                        fp_dist = libfp.get_fp_dist(fp_r, fp_p, self.types)
-                        if fp_dist < best_dist_for_r:
-                            best_dist_for_r = fp_dist
-                    except Exception as e:
-                        print(f"Error calculating distance for personal best update: {e}")
-                        continue
-                
-                # Update personal best if improved
-                if best_dist_for_r < self.pdistx[i]:
-                    self.pdistx[i] = best_dist_for_r
-                    self.pbestx[i] = cp(min_r)
-                    # Only print if significant improvement (e.g., >1% better)
-                    if i == 0 or best_dist_for_r < 0.9 * min(self.pdistx[:i]):
-                        print(f"Updated personal best for reactant particle {i}: {best_dist_for_r:.5f}")
-            
-            for j, min_p in enumerate(minima_from_product):
-                # Find minimum distance to any reactant-side minimum
-                best_dist_for_p = float('inf')
-                for min_r in minima_from_reactant:
-                    fp_r = min_r.get_fp()
-                    fp_p = min_p.get_fp()
-                    
-                    # Make sure types is not None before calling the function
-                    if self.types is None:
-                        print("Warning: self.types is None in personal best update!")
-                        continue
-                    
-                    try:
-                        # fp_dist = fplib2.get_fpdist(self.ntyp, self.types, fp_r, fp_p)
-                        fp_dist = libfp.get_fp_dist(fp_r, fp_p, self.types)
-                        if fp_dist < best_dist_for_p:
-                            best_dist_for_p = fp_dist
-                    except Exception as e:
-                        print(f"Error calculating distance for personal best update: {e}")
-                        continue
-                
-                # Update personal best if improved
-                if best_dist_for_p < self.pdisty[j]:
-                    self.pdisty[j] = best_dist_for_p
-                    self.pbesty[j] = cp(min_p)
-                    # Only print if significant improvement (e.g., >1% better)
-                    if j == 0 or best_dist_for_p < 0.9 * min(self.pdisty[:j]):
-                        print(f"Updated personal best for product particle {j}: {best_dist_for_p:.5f}")
-            
-            # Update velocities for next iteration
-            for i in range(self.popsize):
-                # Update reactant velocity
-                w = self.velocity_weight - 0.5 * step / self.maxstep  # Linearly decreasing weight
-                r1, r2 = np.random.rand(2)
-                
-                # Get velocity components
-                v_pbest_r = self.get_velocity_component(reactant_particles[i], self.pbestx[i])
-                v_gbest_r = self.get_velocity_component(reactant_particles[i], self.gbestx)
-                
-                # Update velocity
-                reactant_velocities[i] = w * reactant_velocities[i] + \
-                                        self.c1 * r1 * v_pbest_r + \
-                                        self.c2 * r2 * v_gbest_r
-                
-                # Update product velocity
-                r1, r2 = np.random.rand(2)
-                
-                # Get velocity components
-                v_pbest_p = self.get_velocity_component(product_particles[i], self.pbesty[i])
-                v_gbest_p = self.get_velocity_component(product_particles[i], self.gbesty)
-                
-                # Update velocity
-                product_velocities[i] = w * product_velocities[i] + \
-                                       self.c1 * r1 * v_pbest_p + \
-                                       self.c2 * r2 * v_gbest_p
-            
-            # Check for termination
+        self.reactant = self.init_minima[0]
+        self.product = self.init_minima[1]
+
+    # ── PSO core ─────────────────────────────────────────────────────
+
+    def run_pso(self):
+        """Bidirectional PSO search for transition pathway.
+
+        Returns
+        -------
+        nx.Graph — pathway network with minima/saddle nodes and weighted edges.
+        """
+        cfg = self.config
+        print("Starting bidirectional PSO pathway search")
+
+        # Optimize reactant and product
+        react_opt = self._optimize_and_register(self.reactant, is_base=True)
+        prod_opt = self._optimize_and_register(self.product, is_base=False)
+
+        react_id, prod_id = react_opt.id, prod_opt.id
+        types = self._get_types(react_opt)
+
+        # Initialize particles (perturbed copies + random velocities)
+        r_particles, r_velocities = [], []
+        p_particles, p_velocities = [], []
+
+        for _ in range(cfg.popsize):
+            r_particles.append(self._add_perturbation(react_opt))
+            r_velocities.append(self._gen_random_velocity(react_opt))
+            p_particles.append(self._add_perturbation(prod_opt))
+            p_velocities.append(self._gen_random_velocity(prod_opt))
+
+        self.pdistx = [float('inf')] * cfg.popsize
+        self.pdisty = [float('inf')] * cfg.popsize
+        self.pbestx = cp(r_particles)
+        self.pbesty = cp(p_particles)
+
+        # Main PSO loop
+        for step in range(cfg.maxstep):
+            print(f"\n=== PSO step {step+1}/{cfg.maxstep} ===")
+
+            # Process all particles on both sides
+            for i in range(cfg.popsize):
+                # Reactant side: saddle → minimum biased toward product
+                r_particles[i] = self._process_particle(
+                    r_particles[i], r_velocities[i],
+                    react_opt, prod_opt, react_id, types,
+                    side="reactant", particle_idx=i
+                )
+
+                # Product side: saddle → minimum biased toward reactant
+                p_particles[i] = self._process_particle(
+                    p_particles[i], p_velocities[i],
+                    prod_opt, react_opt, prod_id, types,
+                    side="product", particle_idx=i
+                )
+
+            # Check for connections between sides
+            connection_found = self._check_connections(
+                r_particles, p_particles, types
+            )
+
+            # Update personal and global bests
+            self._update_bests(r_particles, p_particles, types)
+
+            # Update velocities
+            self._update_velocities(
+                r_particles, r_velocities, p_particles, p_velocities, step
+            )
+
+            # Check if path exists
             if connection_found:
-                print("Connection found between reactant and product!")
-                # Try to find path
+                print("Connection found! Searching for path...")
                 try:
-                    paths = find_path(self.G, react_id, prod_id)
-                    if paths:
-                        print(f"Found {len(paths)} possible paths from reactant to product")
-                        best_path = paths[0]  # First path is the one with lowest energy barrier
-                        print("Best path:", best_path)
-                        # Optional: Can stop if a good path is found
-                        # break
-                except Exception as e:
-                    print(f"Error finding path: {e}")
-            
-            # Save graph after each iteration
-            self.save_graph()
-            
-            # Check if max iterations reached
-            if step == self.maxstep - 1:
-                print("Maximum iterations reached")
-        
-        print("PSO optimization complete")
+                    path, bottleneck = minimax_path(self.G, react_id, prod_id)
+                    print(f"Path found: {path}")
+                    print(f"Bottleneck energy: {bottleneck:.4f}")
+                except nx.NetworkXNoPath:
+                    print("Connected but no path yet (graph not fully linked)")
+
+            self._save_state()
+
+        print("\nPSO search complete")
         return self.G
-    
-    def gen_random_velocity(self, structure):
-        """Generate a random initial velocity for PSO."""
-        natom = len(structure)
-        mode = np.zeros((natom + 3, 3))
-        mode = vrand(mode)
-        # Constrain redundant freedoms
+
+    def _optimize_and_register(self, structure, is_base=False):
+        """Optimize a structure and register it in the graph."""
+        cfg = self.config
+        opt = local_optimization(structure, fmax=cfg.opt_fmax, steps=cfg.opt_steps)
+        idm, _ = self._update_minima(opt)
+        opt.id = idm
+
+        if is_base:
+            self.baseenergy = (opt.get_volume() * self.config.press * GPa
+                               + opt.get_potential_energy())
+            h = 0.0
+        else:
+            h = (opt.get_volume() * self.config.press * GPa
+                 + opt.get_potential_energy() - self.baseenergy)
+
+        self.G.add_node(idm, xname=f'M{idm}', e=h, volume=opt.get_volume())
+        print(f"Registered {'base' if is_base else 'target'}: "
+              f"ID={idm}, H={h:.4f} eV")
+        return opt
+
+    def _process_particle(self, particle, velocity, anchor_opt, target_opt,
+                          anchor_id, types, side="", particle_idx=0):
+        """Process one PSO particle: find saddle → relax to new minimum.
+
+        Used identically for both reactant and product sides.
+
+        Parameters
+        ----------
+        particle : PallasAtom — current particle position.
+        velocity : np.ndarray — current velocity mode.
+        anchor_opt : PallasAtom — optimized anchor (reactant or product).
+        target_opt : PallasAtom — optimized target to bias toward.
+        anchor_id : int — graph node ID for the anchor.
+        types : np.ndarray — atom type array.
+        side : str — label for logging.
+        particle_idx : int — particle index for logging.
+
+        Returns
+        -------
+        PallasAtom — new minimum found from saddle descent.
+        """
+        try:
+            # Find saddle point
+            saddle = self._calculate_saddle_with_velocity(particle, velocity)
+            sad_id, _ = self._update_saddle(saddle)
+            saddle.id = sad_id
+
+            h_sad = (saddle.get_volume() * self.config.press * GPa
+                     + saddle.get_potential_energy() - self.baseenergy)
+            self.G.add_node(sad_id, xname=f'S{sad_id}', e=h_sad,
+                            volume=saddle.get_volume())
+
+            # Edge: anchor → saddle
+            fp_a = anchor_opt.get_fp()
+            fp_s = saddle.get_fp()
+            fp_dist = fp_distance(fp_a, fp_s, types)
+            edge_w = max(self.G.nodes[anchor_id]['e'], h_sad)
+            self.G.add_edge(anchor_id, sad_id, weight=edge_w, dist=fp_dist)
+
+            # Bias saddle toward target, then optimize
+            cfg = self.config
+            target_fp = target_opt.get_fp()
+            biased = self._xcal_bias(saddle, target_fp)
+            new_min = local_optimization(biased, fmax=cfg.opt_fmax, steps=cfg.opt_steps)
+            min_id, _ = self._update_minima(new_min)
+            new_min.id = min_id
+
+            h_min = (new_min.get_volume() * self.config.press * GPa
+                     + new_min.get_potential_energy() - self.baseenergy)
+            self.G.add_node(min_id, xname=f'M{min_id}', e=h_min,
+                            volume=new_min.get_volume())
+
+            # Edge: saddle → new minimum
+            fp_m = new_min.get_fp()
+            fp_dist2 = fp_distance(fp_s, fp_m, types)
+            edge_w2 = max(h_sad, h_min)
+            self.G.add_edge(sad_id, min_id, weight=edge_w2, dist=fp_dist2)
+
+            print(f"  [{side} p{particle_idx}] saddle S{sad_id} "
+                  f"({h_sad:.3f}) → min M{min_id} ({h_min:.3f})")
+            return new_min
+
+        except Exception as e:
+            print(f"  [{side} p{particle_idx}] FAILED: {e}")
+            return particle
+
+    def _check_connections(self, r_particles, p_particles, types):
+        """Check if any reactant-side minimum is close to a product-side one."""
+        found = False
+        min_dist = float('inf')
+        best_pair = None
+
+        for i, mr in enumerate(r_particles):
+            fp_r = mr.get_fp()
+            if fp_r is None:
+                continue
+            for j, mp in enumerate(p_particles):
+                fp_p = mp.get_fp()
+                if fp_p is None:
+                    continue
+                try:
+                    d = fp_distance(fp_r, fp_p, types)
+                    ediff = abs(mr.get_potential_energy()
+                                - mp.get_potential_energy())
+
+                    if d < self.config.dist_threshold and ediff < self.config.ediff:
+                        # Close enough — add connecting edge
+                        h_r = self.G.nodes.get(mr.id, {}).get('e', 0)
+                        h_p = self.G.nodes.get(mp.id, {}).get('e', 0)
+                        self.G.add_edge(mr.id, mp.id,
+                                        weight=max(h_r, h_p), dist=d)
+                        print(f"  CONNECTION: M{mr.id} ↔ M{mp.id} "
+                              f"(d={d:.5f}, ΔE={ediff:.5f})")
+                        found = True
+
+                    if d < min_dist:
+                        min_dist = d
+                        best_pair = (i, j)
+                except Exception:
+                    continue
+
+        if best_pair and min_dist < self.bestdist:
+            self.bestdist = min_dist
+            self.gbestx = cp(r_particles[best_pair[0]])
+            self.gbesty = cp(p_particles[best_pair[1]])
+            print(f"  Global best distance: {min_dist:.5f}")
+
+        return found
+
+    def _update_bests(self, r_particles, p_particles, types):
+        """Update personal bests for all particles."""
+        for i, mr in enumerate(r_particles):
+            fp_r = mr.get_fp()
+            if fp_r is None:
+                continue
+            best_d = float('inf')
+            for mp in p_particles:
+                fp_p = mp.get_fp()
+                if fp_p is None:
+                    continue
+                try:
+                    d = fp_distance(fp_r, fp_p, types)
+                    best_d = min(best_d, d)
+                except Exception:
+                    continue
+            if best_d < self.pdistx[i]:
+                self.pdistx[i] = best_d
+                self.pbestx[i] = cp(mr)
+
+        for j, mp in enumerate(p_particles):
+            fp_p = mp.get_fp()
+            if fp_p is None:
+                continue
+            best_d = float('inf')
+            for mr in r_particles:
+                fp_r = mr.get_fp()
+                if fp_r is None:
+                    continue
+                try:
+                    d = fp_distance(fp_r, fp_p, types)
+                    best_d = min(best_d, d)
+                except Exception:
+                    continue
+            if best_d < self.pdisty[j]:
+                self.pdisty[j] = best_d
+                self.pbesty[j] = cp(mp)
+
+    def _update_velocities(self, r_particles, r_velocities,
+                           p_particles, p_velocities, step):
+        """Update PSO velocities for next iteration."""
+        cfg = self.config
+        w = cfg.velocity_weight - 0.5 * step / cfg.maxstep  # linear decay
+
+        for i in range(cfg.popsize):
+            r1, r2 = np.random.rand(2)
+            v_pb = self._velocity_toward(r_particles[i], self.pbestx[i])
+            v_gb = self._velocity_toward(r_particles[i], self.gbestx)
+            r_velocities[i] = (w * r_velocities[i]
+                               + cfg.c1 * r1 * v_pb
+                               + cfg.c2 * r2 * v_gb)
+
+            r1, r2 = np.random.rand(2)
+            v_pb = self._velocity_toward(p_particles[i], self.pbesty[i])
+            v_gb = self._velocity_toward(p_particles[i], self.gbesty)
+            p_velocities[i] = (w * p_velocities[i]
+                               + cfg.c1 * r1 * v_pb
+                               + cfg.c2 * r2 * v_gb)
+
+    # ── Structure perturbation & velocity helpers ─────────────────────
+
+    def _add_perturbation(self, structure):
+        """Add random perturbation to structure (positions + cell)."""
+        atoms = cp(structure)
+        natom = len(atoms)
+        vol = atoms.get_volume()
+        jacob = (vol / natom) ** (1.0 / 3.0) * natom ** 0.5
+
+        mode = vrand(np.zeros((natom + 3, 3)))
+        # Constrain redundant freedoms (translation + rotation)
         mode[0] *= 0
         mode[-3, 1:] *= 0
         mode[-2, 2] *= 0
-        # Normalize
         mode = vunit(mode)
-        return mode
-    
-    def calculate_saddle_with_velocity(self, structure, velocity):
-        """Calculate saddle point using the given velocity as an initial direction."""
-        # Make a copy of the structure to avoid modifying the original
-        atoms = cp(structure)
-        
-        # Apply the velocity to get initial displacement
-        natom = len(atoms)
-        vol = atoms.get_volume()
-        jacob = (vol/natom)**(1.0/3.0) * natom**0.5
-        
-        # Displace along the velocity direction
-        velocity = vunit(velocity)
-        cellt = atoms.get_cell() + np.dot(atoms.get_cell(), velocity[-3:]/jacob)
+
+        cellt = atoms.get_cell() + np.dot(atoms.get_cell(), mode[-3:] / jacob)
         atoms.set_cell(cellt, scale_atoms=True)
-        atoms.set_positions(atoms.get_positions() + velocity[:-3])
-        
-        # Calculate saddle point
-        saddle = cal_saddle(atoms)
-        return saddle
-    
-    def get_velocity_component(self, current, target):
-        """Get velocity component pointing from current to target structure."""
+        atoms.set_positions(atoms.get_positions() + mode[:-3])
+        atoms.invalidate_fp()
+        return atoms
+
+    def _gen_random_velocity(self, structure):
+        """Generate random normalized velocity mode."""
+        natom = len(structure)
+        mode = vrand(np.zeros((natom + 3, 3)))
+        mode[0] *= 0
+        mode[-3, 1:] *= 0
+        mode[-2, 2] *= 0
+        return vunit(mode)
+
+    def _velocity_toward(self, current, target):
+        """Compute velocity component pointing from current to target."""
         if current is None or target is None:
-            # Return random velocity if either structure is None
-            return self.gen_random_velocity(current if current is not None else target)
-        
-        # Get positions and cell difference
+            src = current if current is not None else target
+            return self._gen_random_velocity(src)
+
         natom = len(current)
         vol = current.get_volume()
-        jacob = (vol/natom)**(1.0/3.0) * natom**0.5
-        
-        # Initialize velocity
+        jacob = (vol / natom) ** (1.0 / 3.0) * natom ** 0.5
+
         velocity = np.zeros((natom + 3, 3))
-        
-        # Position component
-        pos_diff = target.get_positions() - current.get_positions()
-        velocity[:natom] = pos_diff
-        
-        # Cell component
-        cell_diff = target.get_cell() - current.get_cell()
-        velocity[-3:] = cell_diff / jacob
-        
-        # Normalize
+        velocity[:natom] = target.get_positions() - current.get_positions()
+        velocity[-3:] = (target.get_cell() - current.get_cell()) / jacob
+        return vunit(velocity)
+
+    def _calculate_saddle_with_velocity(self, structure, velocity):
+        """Displace along velocity direction, then find saddle point."""
+        atoms = cp(structure)
+        natom = len(atoms)
+        vol = atoms.get_volume()
+        jacob = (vol / natom) ** (1.0 / 3.0) * natom ** 0.5
+
         velocity = vunit(velocity)
-        return velocity
-        
-    # def run(self):
-    #     """Original run method - kept for backward compatibility."""
-    #     xlist = []
+        cellt = atoms.get_cell() + np.dot(atoms.get_cell(), velocity[-3:] / jacob)
+        atoms.set_cell(cellt, scale_atoms=True)
+        atoms.set_positions(atoms.get_positions() + velocity[:-3])
+        atoms.invalidate_fp()
 
-    #     # Iterate through initial minima
-    #     for i in range(self.num_init_min):
-    #         # Optimize the initial structure
-    #         optx = local_optimization(self.init_minima[i])
-    #         # Update minima and get new ID
-    #         idm, isnew = self.update_minima(optx)
-    #         optx.id = idm
-            
-    #         # Calculate energy (h) relative to base energy
-    #         if i == 0:
-    #             # Set base energy for the first minimum
-    #             self.baseenergy = optx.get_volume()*self.press/1602.176487 + optx.get_potential_energy()
-    #             h = 0.0
-    #         else:
-    #             # Calculate relative energy for subsequent minima
-    #             h = optx.get_volume()*self.press/1602.176487 + optx.get_potential_energy() - self.baseenergy
-            
-    #         # Get volume of the optimized structure
-    #         volume = optx.get_volume()
-            
-    #         # Add node to the graph
-    #         self.G.add_node(idm, xname='M'+str(idm), e=h, volume=volume)
-            
-    #         # Print information about the added node
-    #         print(f"Added node: ID={idm}, Type=Minimum, Energy={h:.4f}, Volume={volume:.4f}")
-            
-    #         # Save the updated graph
-    #         self.save_graph()  
+        cfg = self.config
+        return cal_saddle(atoms, fmax=cfg.saddle_fmax, steps=cfg.saddle_steps)
 
-    #         # For each initial minimum, perform popsize number of saddle point optimizations
-    #         for ip in range(self.popsize):
-    #             try:
-    #                 sadx = cal_saddle(optx)
-    #             except:
-    #                 print(f"Failed to calculate saddle for Minimum {optx.id}")
-    #                 continue
-    #             if sadx.converged:
-    #                 ids, isnew = self.update_saddle(sadx)
-    #                 sadx.id = ids
-    #                 h = sadx.get_volume()*self.press/1602.176487 + sadx.get_potential_energy() - self.baseenergy
-    #                 volume = sadx.get_volume()
-    #                 self.G.add_node(ids, xname='S'+str(ids), e=h, volume=volume)
-    #                 self.G.add_edge(idm, ids)
-    #                 print(f"Added node: ID={ids}, Type=Saddle, Energy={h:.4f}, Volume={volume:.4f}")
-    #                 print(f"Added edge: Minimum {idm} -> Saddle {ids}")
-    #                 self.save_graph()
-    #                 xlist.append(cp(sadx))
-
-    #     # Iterate until reaching maxstep
-    #     for istep in range(self.maxstep):
-    #         print(f'Step: {istep + 1}')
-    #         new_xlist = []
-
-    #         # Process each saddle point
-    #         for saddle in xlist:
-    #             # Generate one local minimum from each saddle point
-    #             try:
-    #                 new_min = local_optimization(saddle)
-    #             except:
-    #                 print(f"Failed to optimize from Saddle {saddle.id}")
-    #                 continue
-
-    #             if new_min.converged:
-    #                 idm, isnew = self.update_minima(new_min)
-    #                 new_min.id = idm
-    #                 h = new_min.get_volume()*self.press/1602.176487 + new_min.get_potential_energy() - self.baseenergy
-    #                 volume = new_min.get_volume()
-    #                 self.G.add_node(idm, xname=f'M{idm}', e=h, volume=volume)
-    #                 self.G.add_edge(saddle.id, idm)
-    #                 print(f"Added node: ID={idm}, Type=Minimum, Energy={h:.4f}, Volume={volume:.4f}")
-    #                 print(f"Added edge: Saddle {saddle.id} -> Minimum {idm}")
-    #                 self.save_graph()
-
-    #                 # Generate one saddle point from the new minimum
-    #                 try:
-    #                     new_saddle = cal_saddle(new_min)
-    #                 except:
-    #                     print(f"Failed to calculate saddle for Minimum {new_min.id}")
-    #                     continue
-
-    #                 if new_saddle.converged:
-    #                     ids, isnew = self.update_saddle(new_saddle)
-    #                     new_saddle.id = ids
-    #                     h = new_saddle.get_volume()*self.press/1602.176487 + new_saddle.get_potential_energy() - self.baseenergy
-    #                     volume = new_saddle.get_volume()
-    #                     self.G.add_node(ids, xname=f'S{ids}', e=h, volume=volume)
-    #                     self.G.add_edge(idm, ids)
-    #                     print(f"Added node: ID={ids}, Type=Saddle, Energy={h:.4f}, Volume={volume:.4f}")
-    #                     print(f"Added edge: Minimum {idm} -> Saddle {ids}")
-    #                     self.save_graph()
-    #                     new_xlist.append(cp(new_saddle))
-
-    #         # Update xlist for the next iteration
-    #         xlist = cp(new_xlist)
-
-    #         if not xlist:
-    #             print("No new structures generated. Stopping the iteration.")
-    #             break
-
-    #         self.save_graph()
-    
-    def save_graph(self):
-        joblib.dump(self.G, 'graph.pkl')
-        nx.write_gml(self.G, 'graph.gml')
-        nx.write_gexf(self.G, 'graph.gexf')
-        joblib.dump(self.dij, 'dij.pkl')       
-
-    def xcal(self, structure, fp0):
+    def _xcal_bias(self, structure, target_fp):
+        """Bias structure toward target fingerprint using XCalculator."""
         atoms = cp(structure)
         calc = XCalculator(
-            parallel=False,
-            atoms = atoms,
-            znucl = self.znucl,
-            fp0 = fp0,
-            cutoff = self.fpcutoff,
-            contract=False, 
-            lmax = self.lmax,
-            nx=self.natx,
-            ntyp=self.ntyp)
+            fp0=target_fp,
+            znucl=self.config.znucl,
+            cutoff=self.config.fpcutoff,
+            natx=self.config.natx,
+        )
         atoms.calc = calc
         af = FrechetCellFilter(atoms)
         opt = FIRE(af, maxstep=0.1, logfile='xcal.log')
-        opt.run(fmax=0.01, steps=60)
+        opt.run(fmax=0.01, steps=self.config.bias_steps)
         return atoms
 
-    def add_perturbation(self, structure):
+    # ── Database / deduplication ──────────────────────────────────────
 
-        
-        # """Add a small random perturbation to atomic positions."""
-        atoms = cp(structure)
-        print("Energy before perturbation: ", atoms.get_potential_energy())
-        # calculate the jacobian for the tangent
-        natom = len(atoms)
-        vol   = atoms.get_volume()
-        jacob = (vol/natom)**(1.0/3.0) * natom**0.5
-
-        #######################################
-        # set the initial mode randomly
-        mode = np.zeros((len(atoms)+3,3))
-        mode = vrand(mode)
-        ##constrain 3 redundant freedoms
-        mode[0]    *=0
-        mode[-3,1:]*=0
-        mode[-2,2] *=0
-        ########################################
-        #
-        ## displace along the initial mode direction
-        mode = vunit(mode)
-        cellt = atoms.get_cell()+np.dot(atoms.get_cell(), mode[-3:]/jacob)
-        atoms.set_cell(cellt, scale_atoms=True)
-        atoms.set_positions(atoms.get_positions() + mode[:-3])
-        print("Energy after perturbation: ", atoms.get_potential_energy())
-        return atoms
-        
-    def cal_fp(self, structure):
-        lat = structure.cell[:]
-        rxyz = structure.get_positions()
-        types = self.types
-        znucl = self.znucl
-        cell = (lat, rxyz, types, znucl)
-        fp = libfp.get_lfp(cell, cutoff=self.fpcutoff, log=False, natx = self.natx, orbital='s')
-        # fp = fplib2.get_fp(False, self.ntyp, self.natx, self.lmax, lat, rxyz, types, znucl, self.fpcutoff)
-        return fp
-    
-    def update_dij(self, id1, id2, fp_dist):
-        if id1 > len(self.dij) or id2 > len(self.dij):
-            dij_back = self.dij.copy()
-            nlen = len(self.dij) * 2
-            self.dij = np.zeros((nlen, nlen), float)
-            self.dij[:][:] = 1000.
-            np.fill_diagonal(self.dij, 0.0)
-            self.dij[:len(dij_back)][:len(dij_back)] = dij_back
-        self.dij[id1][id2] = fp_dist
-        self.dij[id2][id1] = fp_dist
-
-    def update_minima(self, minima):
+    def _update_minima(self, minima):
+        """Register minimum in DB, dedup by FP distance + energy."""
         fpm = minima.get_fp()
         em = minima.get_potential_energy()
+        types = self._get_types(minima)
+
         isnew = True
+        idm = None
         for x in self.db.select(ctyp='minima'):
             fpx = np.array(x.data['fp'])
-            # fp_dist = fplib2.get_fpdist(self.ntyp, self.types, fpm, fpx)
-            # Make sure types is not None before calling the function
-            if self.types is None:
-                print("Warning: self.types is None in update_minima!")
-                continue
-            fp_dist = libfp.get_fp_dist(fpm, fpx, self.types)
-            ediff = np.abs(em - x.data['energy'])
-            if fp_dist < 0.005 and ediff < 0.001:
+            d = fp_distance(fpm, fpx, types)
+            ediff = abs(em - x.data['energy'])
+            if d < 0.005 and ediff < 0.001:
                 idm = x.id
                 isnew = False
                 break
+
         if isnew:
-            fpm_serializable = fpm.tolist() if hasattr(fpm, 'tolist') else fpm
-            idm = self.db.write(minima, ctyp='minima', data={'fp': fpm_serializable, 'energy': float(em)})
-        
+            idm = self.db.write(
+                minima, ctyp='minima',
+                data={'fp': fpm.tolist(), 'energy': float(em)}
+            )
+
+        # Update distance matrix
         for x in self.db.select(ctyp='minima'):
             if x.id != idm:
                 fpx = np.array(x.data['fp'])
-                # fp_dist = fplib2.get_fpdist(self.ntyp, self.types, fpm, fpx)
-                # Make sure types is not None before calling the function
-                if self.types is None:
-                    print("Warning: self.types is None in update_minima loop!")
-                    continue
-                fp_dist = libfp.get_fp_dist(fpm, fpx, self.types)
-                self.update_dij(idm, x.id, fp_dist)
-
+                self.update_dij(idm, x.id, fp_distance(fpm, fpx, types))
         for x in self.db.select(ctyp='saddle'):
             fpx = np.array(x.data['fp'])
-            # fp_dist = fplib2.get_fpdist(self.ntyp, self.types, fpm, fpx)
-            # Make sure types is not None before calling the function
-            if self.types is None:
-                print("Warning: self.types is None in update_minima saddle loop!")
-                continue
-            fp_dist = libfp.get_fp_dist(fpm, fpx, self.types)
-            self.update_dij(idm, x.id, fp_dist)
+            self.update_dij(idm, x.id, fp_distance(fpm, fpx, types))
+
         return idm, isnew
-    
-    def update_saddle(self, saddle):
+
+    def _update_saddle(self, saddle):
+        """Register saddle in DB, dedup by FP distance + energy."""
         fps = saddle.get_fp()
         es = saddle.get_potential_energy()
+        types = self._get_types(saddle)
+
         isnew = True
+        ids = None
         for x in self.db.select(ctyp='saddle'):
             fpx = np.array(x.data['fp'])
-            # fp_dist = fplib2.get_fpdist(self.ntyp, self.types, fps, fpx)
-            # Make sure types is not None before calling the function
-            if self.types is None:
-                print("Warning: self.types is None in update_saddle!")
-                continue
-            fp_dist = libfp.get_fp_dist(fps, fpx, self.types)
-            ediff = np.abs(es - x.data['energy'])
-            if fp_dist < 0.005 and ediff < 0.001:
+            d = fp_distance(fps, fpx, types)
+            ediff = abs(es - x.data['energy'])
+            if d < 0.005 and ediff < 0.001:
                 ids = x.id
                 isnew = False
                 break
+
         if isnew:
-            fps_serializable = fps.tolist() if hasattr(fps, 'tolist') else fps
-            ids = self.db.write(saddle, ctyp='saddle', data={'fp': fps_serializable, 'energy': float(es)})
+            ids = self.db.write(
+                saddle, ctyp='saddle',
+                data={'fp': fps.tolist(), 'energy': float(es)}
+            )
 
         for x in self.db.select(ctyp='saddle'):
-            if x.id != ids:    
+            if x.id != ids:
                 fpx = np.array(x.data['fp'])
-                # fp_dist = fplib2.get_fpdist(self.ntyp, self.types, fps, fpx)
-                # Make sure types is not None before calling the function
-                if self.types is None:
-                    print("Warning: self.types is None in update_saddle loop!")
-                    continue
-                fp_dist = libfp.get_fp_dist(fps, fpx, self.types)
-                self.update_dij(ids, x.id, fp_dist)
-        
+                self.update_dij(ids, x.id, fp_distance(fps, fpx, types))
         for x in self.db.select(ctyp='minima'):
             fpx = np.array(x.data['fp'])
-            # fp_dist = fplib2.get_fpdist(self.ntyp, self.types, fps, fpx)
-            # Make sure types is not None before calling the function
-            if self.types is None:
-                print("Warning: self.types is None in update_saddle minima loop!")
-                continue
-            fp_dist = libfp.get_fp_dist(fps, fpx, self.types)
-            self.update_dij(ids, x.id, fp_dist)
+            self.update_dij(ids, x.id, fp_distance(fps, fpx, types))
+
         return ids, isnew
 
-class PallasAtom(Atoms):
-    def __init__(self, *args, **kwargs):
-        # Initialize the Atom class
-        super().__init__(*args, **kwargs)
-        
-        # Initialize any new attributes for the subclass
-        self.natx = 200
-        self.fpcutoff = 5.5
-        self.fp = None
-        self.converged = False
-        self.id = None
-        self.types = None
-        self.znucl = None
+    # ── I/O ──────────────────────────────────────────────────────────
 
-    def get_fp(self):
-        types = self.types
-        znucl = self.znucl
-        natx = self.natx
-        if self.fp is None:
-            # Check necessary attributes are set
-            if self.types is None:
-                print("Warning: types is None in PallasAtom.get_fp!")
-                return None
-            if self.znucl is None or len(self.znucl) == 0:
-                print("Warning: znucl is None or empty in PallasAtom.get_fp!")
-                return None
-                
+    def _save_state(self):
+        """Save graph and distance matrix to disk."""
+        joblib.dump(self.G, 'graph.pkl')
+        nx.write_gml(self.G, 'graph.gml')
+        nx.write_gexf(self.G, 'graph.gexf')
+        joblib.dump(self.dij, 'dij.pkl')
+
+    def find_best_path(self):
+        """Find minimax-bottleneck path between reactant and product.
+
+        Returns
+        -------
+        path : list of node IDs
+        bottleneck : float — max edge weight along the path.
+        """
+        react_id = self.init_minima[0].id
+        prod_id = self.init_minima[1].id
+        return minimax_path(self.G, react_id, prod_id)
+
+
+# ── Standalone analysis utilities ─────────────────────────────────────
+
+def listpath(graph_file='graph.pkl', db_file='pallas.db',
+             start=1, end=None):
+    """Load saved graph and list all paths between two nodes.
+
+    Parameters
+    ----------
+    graph_file : str — path to saved graph pickle.
+    db_file : str — path to ASE database.
+    start, end : int — node IDs for reactant and product.
+    """
+    G = joblib.load(graph_file)
+    db = ase.db.connect(db_file)
+
+    if end is None:
+        # Find the last minimum node
+        minima_ids = [n for n, d in G.nodes(data=True)
+                      if d.get('xname', '').startswith('M')]
+        if len(minima_ids) < 2:
+            print("Not enough minima nodes in graph")
+            return
+        end = max(minima_ids)
+
+    try:
+        path, bottleneck = minimax_path(G, start, end)
+    except nx.NetworkXNoPath:
+        print(f"No path between {start} and {end}")
+        return
+
+    print(f"Best path (minimax): {path}")
+    print(f"Bottleneck energy: {bottleneck:.4f}")
+
+    # Create output directory
+    os.makedirs("path_output", exist_ok=True)
+
+    with open("path_output/path_info.txt", 'w') as f:
+        f.write(f"Minimax path: {path}\n")
+        f.write(f"Bottleneck energy: {bottleneck:.6f}\n")
+        f.write(f"Number of nodes: {len(path)}\n\n")
+
+        cumulative_dist = 0.0
+        for j, node in enumerate(path):
+            nd = G.nodes[node]
+            ntype = 'Minimum' if nd['xname'].startswith('M') else 'Saddle'
+            f.write(f"Node {node} ({ntype}): E={nd['e']:.6f}, "
+                    f"V={nd['volume']:.4f}\n")
+            print(f"  {ntype} {node}: E={nd['e']:.4f}")
+
+            # Write POSCAR
             try:
-                self.fp = self.cal_fp()
-            except Exception as e:
-                print(f"Error calculating fingerprint: {e}")
-                return None
-        return self.fp
-    
-    def cal_fp(self):
-        lat = self.get_cell()
-        rxyz = self.get_positions()
-        types = self.types
-        znucl = self.znucl
-        natx = self.natx
-        
-        # Safety checks
-        if types is None:
-            print("Warning: types is None in PallasAtom.cal_fp!")
-            return None
-        if znucl is None or len(znucl) == 0:
-            print("Warning: znucl is None or empty in PallasAtom.cal_fp!")
-            return None
-            
-        try:
-            cell = (lat, rxyz, types, znucl)
-            fp = libfp.get_lfp(cell, cutoff=self.fpcutoff, log=False, natx = natx, orbital='s')
-            self.fp = fp
-            return fp
-        except Exception as e:
-            print(f"Error in libfp.get_lfp: {e}")
-            return None
+                atoms = db.get_atoms(node)
+                write(f"path_output/{node}_POSCAR", atoms,
+                      format='vasp', direct=True)
+            except Exception:
+                pass
 
+            # Edge info
+            if j < len(path) - 1:
+                ed = G.get_edge_data(path[j], path[j + 1])
+                w = ed.get('weight', float('inf'))
+                d = ed.get('dist', 0.0)
+                cumulative_dist += d
+                f.write(f"  → next: weight={w:.6f}, dist={d:.6f}\n")
+
+    print(f"Output written to path_output/")
+
+
+# ── Entry points ──────────────────────────────────────────────────────
 
 def main():
-    pallas = Pallas()
-    poscars = ['POSCAR1', 'POSCAR2']
-    pallas.init_run(poscars)
+    """Default run: read POSCAR1/POSCAR2, run PSO search."""
+    config = PallasConfig()
+    # Read first POSCAR to infer znucl
+    atoms = read('POSCAR1', format='vasp')
+    config.znucl = sorted(set(atoms.get_atomic_numbers().tolist()))
+
+    pallas = Pallas(config)
+    pallas.init_run(['POSCAR1', 'POSCAR2'])
     pallas.run_pso()
 
 
-def x2PAtom(xdb, x):
-    xx = xdb.get_atoms(x.id)
-    xxx = PallasAtom(xx)
-    xxx.fp = x.data['fp']
-    return xxx
-        
-
-
-def find_path(graph, start, end):
-    """
-    Find the minimax path between two given nodes in the Graph.
-    This function extracts the lowest-barrier paths with the least number of intermediate transition states.
-    
-    Args:
-    graph (networkx.Graph): The graph representing the energy landscape.
-    start, end: The starting and ending node IDs
-    
-    Returns:
-    list: Paths sorted by energy barrier (lowest first) and then by length
-    """
-    
-    def minimax_cost(path):
-        """Calculate the minimax cost of a path using edge weights."""
-        max_weight = 0
-        total_dist = 0
-        for i in range(len(path) - 1):
-            edge_data = graph.get_edge_data(path[i], path[i+1])
-            weight = edge_data.get('weight', float('inf'))
-            dist = edge_data.get('dist', float('inf'))
-            max_weight = max(max_weight, weight)
-            total_dist += dist
-        return max_weight, total_dist
-    
-    def dfs_paths(start, end, path=None):
-        """Depth-first search to find all paths."""
-        if path is None:
-            path = [start]
-        if start == end:
-            yield path
-        for neighbor in graph.neighbors(start):
-            if neighbor not in path:
-                yield from dfs_paths(neighbor, end, path + [neighbor])
-    
-    # Find all paths and sort them by minimax cost and length
-    all_paths = list(dfs_paths(start, end))
-    # Sort by: 1) max energy barrier, 2) total fingerprint distance, 3) path length 
-    all_paths.sort(key=lambda p: (minimax_cost(p)[0], minimax_cost(p)[1], len(p)))
-    
-    return all_paths
-
-
-
-def listpath():
-    # Load the saved graph
-    G = joblib.load('graph.pkl')
-    
-    # Load the pallas.json database
-    db = ase.db.connect('pallas.json')
-    
-    start = 1
-    end = 11
-    
-    # Find all paths between the two minima
-    paths = find_path(G, start, end)
-    
-    if paths:
-        print(f"Found {len(paths)} paths between {start} and {end}:")
-        for i, path in enumerate(paths, 1):
-            # Calculate path properties using edge attributes
-            max_energy = 0
-            total_distance = 0
-            
-            for j in range(len(path)-1):
-                edge_data = G.get_edge_data(path[j], path[j+1])
-                weight = edge_data.get('weight', float('inf'))
-                dist = edge_data.get('dist', float('inf'))
-                max_energy = max(max_energy, weight)
-                total_distance += dist
-            
-            print(f"\nPath {i}: Max Energy Barrier = {max_energy:.4f}, Total FP Distance = {total_distance:.4f}, Length = {len(path)}")
-            
-            # Create a folder for this path
-            path_folder = f"path_{i}"
-            os.makedirs(path_folder, exist_ok=True)
-            
-            # Write path information to a summary file
-            with open(os.path.join(path_folder, "path_info.txt"), 'w') as f:
-                f.write(f"Path {i}\n")
-                f.write(f"Max Energy Barrier: {max_energy:.6f}\n")
-                f.write(f"Total FP Distance: {total_distance:.6f}\n")
-                f.write(f"Number of nodes: {len(path)}\n\n")
-                f.write("Node details:\n")
-                
-                for j, node in enumerate(path):
-                    node_data = G.nodes[node]
-                    node_type = 'Minimum' if node_data['xname'].startswith('M') else 'Saddle'
-                    f.write(f"Node {node} ({node_type}): Energy = {node_data['e']:.6f}, Volume = {node_data['volume']:.6f}\n")
-                    
-                    # Write edge information
-                    if j < len(path) - 1:
-                        edge_data = G.get_edge_data(path[j], path[j+1])
-                        edge_weight = edge_data.get('weight', float('inf'))
-                        edge_dist = edge_data.get('dist', float('inf'))
-                        f.write(f"  Edge to next node: Weight = {edge_weight:.6f}, FP Distance = {edge_dist:.6f}\n")
-            
-            for node in path:
-                node_data = G.nodes[node]
-                node_type = 'Minimum' if node_data['xname'].startswith('M') else 'Saddle'
-                print(f"  Node {node} ({node_type}): Energy = {node_data['e']:.4f}, Volume = {node_data['volume']:.4f}")
-                
-                # Get the structure from the database
-                structure_data = db.get_atoms(node)
-                if structure_data:
-                    write(os.path.join(path_folder, f"{node}_POSCAR"), structure_data, format='vasp', direct=True)
-                else:
-                    print(f"    Warning: Structure data not found for node {node}")
-
-    else:
-        print(f"No paths found between {start} and {end}.")
-    
-    # Create a directory to store all path files
-    os.makedirs("path_energies", exist_ok=True)
-
-    for i, path in enumerate(paths, 1):
-        filename = f"path_energies/path_{i}_energy.txt"
-        with open(filename, 'w') as f:
-            f.write(f"#Path {i}\n")
-            f.write("#Distance Energy EdgeWeight\n")
-            
-            cumulative_distance = 0.0
-            for j, node in enumerate(path):
-                node_data = G.nodes[node]
-                energy = node_data['e']
-                
-                if j == 0:
-                    f.write(f"{cumulative_distance:.6f} {energy:.6f} 0.0\n")
-                else:
-                    prev_node = path[j-1]
-                    edge_data = G.get_edge_data(prev_node, node)
-                    edge_weight = edge_data.get('weight', float('inf'))
-                    edge_dist = edge_data.get('dist', 0.0)
-                    cumulative_distance += edge_dist
-                    f.write(f"{cumulative_distance:.6f} {energy:.6f} {edge_weight:.6f}\n")
-
-    print("Energy profiles for all paths have been written to separate files in the 'path_energies' directory.")
-
-def test():
-    pp0 = read('POSCAR', format='vasp')
-    print (pp0.numbers)
-
-    pp = PallasAtom(pp0)
-
-    print (pp.get_cell())
-    write('px', pp, format='vasp')
-    print (pp.get_atomic_numbers())
-    print (pp.get_positions())
-    print (pp.get_scaled_positions())
-    print (pp.get_chemical_symbols())
-    print (pp.get_masses())
-    # print (pp.get_tags())
-    # print (pp.get_velocities())
-    t1 = time.time()
-    fp1= pp.get_fp()
-    t2 = time.time()
-    # print (fp1)
-    fp1 = pp.get_fp()
-    t3 = time.time()
-    print (t2-t1)
-    print (t3-t2)
-    print (np.shape(fp1))
-
-
-
-
-    optatom = local_optimization(pp)
-    print (optatom.get_potential_energy())
-    print (optatom.get_forces())
-    print (optatom.get_stress())
-    print (optatom.get_cell()) 
-    print (optatom.get_volume())
-    # optatom = cal_saddle(pp)
-    # print (optatom.get_cell())
-    # print (optatom.get_fp())
-    # fff = optatom.get_forces()
-    # print (fff)
-    # print (np.max(np.abs(fff)))
-    # print (optatom.converged)
-
-class GraphVisualizer:
-    def __init__(self, graph):
-        """
-        Initializes the graph visualization with a given graph.
-        
-        :param graph: The graph to visualize (networkx.Graph)
-        """
-        self.graph = graph
-        self.fig, self.ax = plt.subplots(figsize=(8, 6))
-        self.pos = nx.spring_layout(graph)
-        self.node_size = 500
-        self.node_color = 'lightblue'
-        self.edge_color = 'gray'
-
-    def draw_graph(self):
-        nx.draw_networkx_nodes(self.graph, self.pos, node_size=self.node_size, node_color=self.node_color, ax=self.ax)
-        nx.draw_networkx_edges(self.graph, self.pos, width=1, edge_color=self.edge_color, ax=self.ax)
-        nx.draw_networkx_labels(self.graph, self.pos, font_size=12, font_weight='bold', ax=self.ax)
-        plt.title("Dynamic Graph Visualization")
-
-    def update(self, frame):
-        #Updates the graph for a given frame in the animation. 
-        self.ax.clear()
-        
-        self.graph.add_node(frame)
-        if frame > 0:
-            self.graph.add_edge(frame-1, frame)
-        
-        self.draw_graph()
-        self.ax.set_title(f"Frame {frame}", fontsize=16)
-
-    def animate(self, frames=10, interval=1000):
-        ani = FuncAnimation(self.fig, self.update, frames=frames, interval=interval, repeat=False)
-        plt.show()
-
-
-
 if __name__ == "__main__":
-    # test()
     main()
-    # listpath()
-    

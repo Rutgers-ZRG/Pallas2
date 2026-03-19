@@ -3,7 +3,7 @@ import torch
 from loguru import logger
 from ase import io
 from ase.optimize import FIRE, BFGS
-from ase.constraints import ExpCellFilter
+from ase.filters import FrechetCellFilter
 from mattersim.forcefield import MatterSimCalculator
 from pymatgen.io.ase import AseAtomsAdaptor
 from pymatgen.symmetry.analyzer import SpacegroupAnalyzer
@@ -41,7 +41,7 @@ except Exception as e:
 
 print_spacegroup(structure)
 
-ecf = ExpCellFilter(structure)  
+ecf = FrechetCellFilter(structure)
 dyn = BFGS(ecf, trajectory="optim.traj")
 success = dyn.run(fmax=0.01, steps=500)
 
