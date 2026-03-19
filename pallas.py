@@ -567,25 +567,31 @@ class Pallas:
 
     # ── FP-guided chain-growing search ────────────────────────────────
 
-    def run_fp_guided(self):
-        """FP-gradient-guided bidirectional chain-growing pathway search.
+    def run_fp_guided(self, n_probes=1):
+        """FP-gradient-guided bidirectional multi-probe pathway search.
 
-        Grows chains from both reactant (A) and product (B) simultaneously.
-        At each step:
-        1. Compute FP-gradient direction toward the opposite endpoint
-        2. Perturb along this direction (directed, not random)
-        3. Run dimer with FP-gradient as initial mode
-        4. Validate saddle (energy must exceed the departing minimum)
-        5. Push saddle toward target with small FP-gradient step
-        6. Optimize on real PES to find next minimum
-        7. Check if chains have connected
+        At each step, launches ``n_probes`` saddle searches per side with
+        varying FP-gradient / random mixing ratios.  All discovered saddles
+        and minima feed into a single graph; ``minimax_path`` automatically
+        extracts the lowest-bottleneck route.
+
+        Probe mixing schedule (per step, per side):
+          probe 0 : pure FP gradient        (alpha = 1.0)
+          probe 1 : 70 % FP + 30 % random   (alpha = 0.7)
+          probe 2 : 40 % FP + 60 % random   (alpha = 0.4)
+          probe 3+: 10 % FP + 90 % random   (alpha = 0.1)
+
+        Parameters
+        ----------
+        n_probes : int
+            Saddle searches per side per step (default 1 = pure FP guided).
 
         Returns
         -------
         nx.Graph — pathway network.
         """
         cfg = self.config
-        print("Starting FP-guided chain-growing search")
+        print(f"Starting FP-guided search (n_probes={n_probes})")
 
         # Optimize endpoints
         A = self._optimize_and_register(self.reactant, is_base=True)
@@ -595,63 +601,139 @@ class Pallas:
         d0 = fp_distance(A.get_fp(), B.get_fp(), types)
         print(f"Initial FP distance A↔B: {d0:.5f}")
 
-        # Bidirectional chains
-        chain_A = [A]       # grows from A toward B
-        chain_B = [B]       # grows from B toward A
+        # Track all discovered minima per side (for multi-probe branching)
+        minima_A = [A]      # all minima reachable from A
+        minima_B = [B]      # all minima reachable from B
+
+        best_bottleneck = float('inf')
+        best_path = None
 
         for step in range(cfg.maxstep):
-            tip_A = chain_A[-1]
-            tip_B = chain_B[-1]
+            # Pick the chain tip closest to the other side
+            tip_A = self._closest_to(minima_A, B.get_fp(), types)
+            tip_B = self._closest_to(minima_B, A.get_fp(), types)
 
-            # Current distance between chain tips
             d_tips = fp_distance(tip_A.get_fp(), tip_B.get_fp(), types)
             ediff = abs(tip_A.get_potential_energy()
                         - tip_B.get_potential_energy())
-            print(f"\n=== Step {step+1}/{cfg.maxstep} | "
-                  f"d(tips)={d_tips:.5f}, ΔE={ediff:.5f} ===")
 
-            # Check if chains connected
+            # Report current best path if exists
+            bn_str = f", best barrier={best_bottleneck:.4f}" \
+                if best_path else ""
+            print(f"\n=== Step {step+1}/{cfg.maxstep} | "
+                  f"d(tips)={d_tips:.5f}, ΔE={ediff:.5f}{bn_str} ===")
+
+            # Check if tips connected
             if d_tips < cfg.dist_threshold and ediff < cfg.ediff:
                 h_a = self.G.nodes[tip_A.id]['e']
                 h_b = self.G.nodes[tip_B.id]['e']
                 self.G.add_edge(tip_A.id, tip_B.id,
                                 weight=max(h_a, h_b), dist=d_tips)
-                print(f"Chains connected! M{tip_A.id} ↔ M{tip_B.id}")
-                break
+                print(f"  Tips connected: M{tip_A.id} ↔ M{tip_B.id}")
 
-            # Adaptive step scale: larger when far, smaller when close
+            # Adaptive step scale
             progress = d_tips / max(d0, 1e-10)
             step_scale = cfg.fp_step_scale * max(progress, 0.1)
 
-            # A-side: grow toward B
-            new_A = self._fp_guided_step(
-                tip_A, B.get_fp(), types, step_scale, side="A→B")
-            if new_A is not tip_A:
-                chain_A.append(new_A)
+            # Multi-probe: launch n_probes from each side
+            for p in range(n_probes):
+                alpha = max(1.0 - 0.3 * p, 0.1)
+                label_A = f"A→B p{p}(α={alpha:.1f})"
+                label_B = f"B→A p{p}(α={alpha:.1f})"
 
-            # B-side: grow toward A
-            new_B = self._fp_guided_step(
-                tip_B, A.get_fp(), types, step_scale, side="B→A")
-            if new_B is not tip_B:
-                chain_B.append(new_B)
+                # A-side probe
+                new_A = self._fp_guided_step(
+                    tip_A, B.get_fp(), types, step_scale,
+                    alpha=alpha, side=label_A)
+                if new_A is not tip_A:
+                    minima_A.append(new_A)
+
+                # B-side probe
+                new_B = self._fp_guided_step(
+                    tip_B, A.get_fp(), types, step_scale,
+                    alpha=alpha, side=label_B)
+                if new_B is not tip_B:
+                    minima_B.append(new_B)
+
+            # Cross-check: connect any close A/B minima pairs
+            self._cross_connect(minima_A, minima_B, types)
+
+            # Update best path
+            try:
+                path, bottleneck = minimax_path(self.G, A.id, B.id)
+                if bottleneck < best_bottleneck:
+                    best_bottleneck = bottleneck
+                    best_path = path
+                    print(f"  New best path: {' → '.join(str(n) for n in path)}"
+                          f" (barrier={bottleneck:.4f})")
+            except nx.NetworkXNoPath:
+                pass
 
             self._save_state()
 
-        # Final path search
-        try:
-            path, bottleneck = minimax_path(self.G, A.id, B.id)
-            print(f"\nPath found: {' → '.join(str(n) for n in path)}")
-            print(f"Bottleneck energy: {bottleneck:.4f} eV")
-        except nx.NetworkXNoPath:
-            print("\nNo complete path found (increase maxstep)")
-
-        print(f"\nGraph: {self.G.number_of_nodes()} nodes, "
+        # Final report
+        n_min = sum(1 for _, d in self.G.nodes(data=True)
+                    if d['xname'].startswith('M'))
+        n_sad = sum(1 for _, d in self.G.nodes(data=True)
+                    if d['xname'].startswith('S'))
+        print(f"\nGraph: {n_min} minima, {n_sad} saddles, "
               f"{self.G.number_of_edges()} edges")
-        print(f"A-chain length: {len(chain_A)}, B-chain length: {len(chain_B)}")
+        print(f"Discovered minima: {len(minima_A)} (A-side), "
+              f"{len(minima_B)} (B-side)")
+
+        if best_path:
+            print(f"\nBest path: {' → '.join(str(n) for n in best_path)}")
+            print(f"Bottleneck energy: {best_bottleneck:.4f} eV")
+            for node in best_path:
+                nd = self.G.nodes[node]
+                ntype = 'MIN' if nd['xname'].startswith('M') else 'SAD'
+                print(f"  {ntype} {node}: E = {nd['e']:.4f} eV, "
+                      f"V = {nd['volume']:.1f}")
+        else:
+            print("\nNo complete path found (increase maxstep or n_probes)")
+
         return self.G
 
+    def _closest_to(self, minima_list, target_fp, types):
+        """Return the minimum from the list closest to target in FP space."""
+        best = minima_list[0]
+        best_d = float('inf')
+        for m in minima_list:
+            fp = m.get_fp()
+            if fp is None:
+                continue
+            d = fp_distance(fp, target_fp, types)
+            if d < best_d:
+                best_d = d
+                best = m
+        return best
+
+    def _cross_connect(self, minima_A, minima_B, types):
+        """Check all A-B minima pairs and add graph edges for close matches."""
+        cfg = self.config
+        for ma in minima_A:
+            fp_a = ma.get_fp()
+            if fp_a is None or ma.id is None:
+                continue
+            for mb in minima_B:
+                fp_b = mb.get_fp()
+                if fp_b is None or mb.id is None:
+                    continue
+                if self.G.has_edge(ma.id, mb.id):
+                    continue
+                d = fp_distance(fp_a, fp_b, types)
+                ediff = abs(ma.get_potential_energy()
+                            - mb.get_potential_energy())
+                if d < cfg.dist_threshold and ediff < cfg.ediff:
+                    h_a = self.G.nodes.get(ma.id, {}).get('e', 0)
+                    h_b = self.G.nodes.get(mb.id, {}).get('e', 0)
+                    self.G.add_edge(ma.id, mb.id,
+                                    weight=max(h_a, h_b), dist=d)
+                    print(f"  CONNECT: M{ma.id} ↔ M{mb.id} "
+                          f"(d={d:.5f})")
+
     def _fp_guided_step(self, current, target_fp, types,
-                        step_scale, side=""):
+                        step_scale, alpha=1.0, side=""):
         """One step of FP-guided chain growing.
 
         Parameters
@@ -660,6 +742,7 @@ class Pallas:
         target_fp : np.ndarray — target fingerprint to grow toward.
         types : np.ndarray — atom type array.
         step_scale : float — perturbation magnitude.
+        alpha : float — FP/random mixing ratio (1.0 = pure FP, 0.0 = pure random).
         side : str — label for logging.
 
         Returns
@@ -668,8 +751,10 @@ class Pallas:
         """
         cfg = self.config
 
-        # Step 1: FP gradient mode (direction toward target in FP space)
-        mode = self._fp_gradient_mode(current, target_fp)
+        # Step 1: Build search mode from FP gradient + random component
+        fp_mode = self._fp_gradient_mode(current, target_fp)
+        rand_mode = self._gen_random_velocity(current)
+        mode = vunit(alpha * fp_mode + (1.0 - alpha) * rand_mode)
 
         # Step 2+3: Perturb along mode, run dimer with this mode
         saddle = None
@@ -1056,14 +1141,14 @@ def listpath(graph_file='graph.pkl', db_file='pallas.db',
 # ── Entry points ──────────────────────────────────────────────────────
 
 def main():
-    """Default run: read POSCAR1/POSCAR2, run FP-guided search."""
+    """Default run: read POSCAR1/POSCAR2, run FP-guided multi-probe search."""
     config = PallasConfig()
     atoms = read('POSCAR1', format='vasp')
     config.znucl = sorted(set(atoms.get_atomic_numbers().tolist()))
 
     pallas = Pallas(config)
     pallas.init_run(['POSCAR1', 'POSCAR2'])
-    pallas.run_fp_guided()
+    pallas.run_fp_guided(n_probes=3)
 
 
 if __name__ == "__main__":
