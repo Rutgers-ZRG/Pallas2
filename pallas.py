@@ -65,6 +65,10 @@ class PallasConfig:
     fp_push_scale: float = 0.1      # post-saddle push scale toward target
     max_retries: int = 2            # retries with smaller step on saddle failure
 
+    # Barrier refinement parameters
+    refine_rounds: int = 3          # number of refinement iterations
+    refine_probes: int = 5          # saddle searches per refinement round
+
     # Convergence
     ediff: float = 0.001            # energy diff threshold for same structure
     dist_threshold: float = 0.01    # FP distance threshold for connection
@@ -693,6 +697,185 @@ class Pallas:
             print("\nNo complete path found (increase maxstep or n_probes)")
 
         return self.G
+
+    def refine_barrier(self, n_rounds=None, n_probes=None):
+        """Iteratively attack the bottleneck saddle on the current best path.
+
+        Each round:
+        1. Find current best (minimax) path
+        2. Identify the highest-energy saddle node on the path
+        3. Get the minima on either side of that saddle
+        4. Launch ``n_probes`` saddle searches from both adjacent minima,
+           targeting each other (trying to find a lower alternative saddle)
+        5. All new structures enter the graph; re-run minimax
+
+        Repeats for ``n_rounds`` or until no improvement is found.
+
+        Parameters
+        ----------
+        n_rounds : int, optional — override config.refine_rounds.
+        n_probes : int, optional — override config.refine_probes.
+
+        Returns
+        -------
+        tuple : (best_path, best_bottleneck) or (None, inf) if no path.
+        """
+        cfg = self.config
+        n_rounds = n_rounds or cfg.refine_rounds
+        n_probes = n_probes or cfg.refine_probes
+
+        A_id = self.init_minima[0].id
+        B_id = self.init_minima[1].id
+        types = self._get_types(self.init_minima[0])
+
+        try:
+            best_path, best_bn = minimax_path(self.G, A_id, B_id)
+        except nx.NetworkXNoPath:
+            print("No path exists to refine.")
+            return None, float('inf')
+
+        print(f"\n{'='*60}")
+        print(f"Barrier refinement: {n_rounds} rounds x {n_probes} probes")
+        print(f"Starting barrier: {best_bn:.4f} eV")
+        print(f"Starting path: {' -> '.join(str(n) for n in best_path)}")
+        print(f"{'='*60}")
+
+        # Load all known minima from DB as PallasAtom objects
+        all_minima = {}
+        for x in self.db.select(ctyp='minima'):
+            pa = PallasAtom(self.db.get_atoms(x.id))
+            pa.znucl = cfg.znucl
+            pa.fpcutoff = cfg.fpcutoff
+            pa.natx = cfg.natx
+            pa.id = x.id
+            pa.fp = np.array(x.data['fp'])
+            all_minima[x.id] = pa
+
+        prev_bn = float('inf')
+
+        for rnd in range(n_rounds):
+            # Find the highest-energy saddle node on the current best path
+            worst_saddle_id = None
+            worst_saddle_e = -float('inf')
+            worst_idx = -1
+            for i, node in enumerate(best_path):
+                nd = self.G.nodes[node]
+                if nd['xname'].startswith('S') and nd['e'] > worst_saddle_e:
+                    worst_saddle_e = nd['e']
+                    worst_saddle_id = node
+                    worst_idx = i
+
+            if worst_saddle_id is None:
+                print(f"  Round {rnd+1}: no saddle on path, nothing to refine")
+                break
+
+            # Find the minima on either side of the bottleneck saddle
+            min_before_id = None
+            for i in range(worst_idx - 1, -1, -1):
+                if self.G.nodes[best_path[i]]['xname'].startswith('M'):
+                    min_before_id = best_path[i]
+                    break
+            min_after_id = None
+            for i in range(worst_idx + 1, len(best_path)):
+                if self.G.nodes[best_path[i]]['xname'].startswith('M'):
+                    min_after_id = best_path[i]
+                    break
+
+            if min_before_id is None or min_after_id is None:
+                print(f"  Round {rnd+1}: cannot find minima flanking "
+                      f"saddle S{worst_saddle_id}")
+                break
+
+            min_before = all_minima.get(min_before_id)
+            min_after = all_minima.get(min_after_id)
+            if min_before is None or min_after is None:
+                print(f"  Round {rnd+1}: cannot load M{min_before_id} or "
+                      f"M{min_after_id}")
+                break
+
+            e_before = self.G.nodes[min_before_id]['e']
+            e_after = self.G.nodes[min_after_id]['e']
+
+            print(f"\n  Round {rnd+1}/{n_rounds}: bottleneck S{worst_saddle_id} "
+                  f"(E={worst_saddle_e:.4f})")
+            print(f"    Between M{min_before_id} ({e_before:.4f}) and "
+                  f"M{min_after_id} ({e_after:.4f})")
+
+            # Launch probes from both sides of the bottleneck
+            for p in range(n_probes):
+                alpha = max(1.0 - 0.2 * p, 0.1)
+                step_scale = cfg.fp_step_scale * (0.5 + 0.5 * np.random.rand())
+
+                # From min_before toward min_after
+                label = f"refine r{rnd+1} fwd p{p}(a={alpha:.1f})"
+                new_min = self._fp_guided_step(
+                    min_before, min_after.get_fp(), types, step_scale,
+                    alpha=alpha, side=label)
+                if new_min is not min_before and new_min.id not in all_minima:
+                    all_minima[new_min.id] = new_min
+
+                # From min_after toward min_before
+                label = f"refine r{rnd+1} rev p{p}(a={alpha:.1f})"
+                new_min = self._fp_guided_step(
+                    min_after, min_before.get_fp(), types, step_scale,
+                    alpha=alpha, side=label)
+                if new_min is not min_after and new_min.id not in all_minima:
+                    all_minima[new_min.id] = new_min
+
+            # Cross-connect new minima
+            min_list = [m for m in all_minima.values() if m.id is not None]
+            for ma in min_list:
+                for mb in min_list:
+                    if ma.id >= mb.id or self.G.has_edge(ma.id, mb.id):
+                        continue
+                    d = fp_distance(ma.get_fp(), mb.get_fp(), types)
+                    ediff = abs(ma.get_potential_energy()
+                                - mb.get_potential_energy())
+                    if d < cfg.dist_threshold and ediff < cfg.ediff:
+                        h_a = self.G.nodes.get(ma.id, {}).get('e', 0)
+                        h_b = self.G.nodes.get(mb.id, {}).get('e', 0)
+                        self.G.add_edge(ma.id, mb.id,
+                                        weight=max(h_a, h_b), dist=d)
+
+            # Re-evaluate best path
+            try:
+                path, bn = minimax_path(self.G, A_id, B_id)
+                if bn < best_bn:
+                    print(f"    IMPROVED: {best_bn:.4f} -> {bn:.4f} eV")
+                    print(f"    New path: {' -> '.join(str(n) for n in path)}")
+                    best_bn = bn
+                    best_path = path
+                else:
+                    print(f"    No improvement (barrier still {best_bn:.4f})")
+            except nx.NetworkXNoPath:
+                print(f"    Path lost during refinement")
+
+            self._save_state()
+
+            # Early stop if no improvement for 2 consecutive rounds
+            if best_bn >= prev_bn and rnd > 0:
+                print(f"    Stopping: no improvement for 2 rounds")
+                break
+            prev_bn = best_bn
+
+        # Final report
+        print(f"\nRefinement complete.")
+        print(f"Final barrier: {best_bn:.4f} eV")
+        print(f"Final path: {' -> '.join(str(n) for n in best_path)}")
+        for node in best_path:
+            nd = self.G.nodes[node]
+            ntype = 'MIN' if nd['xname'].startswith('M') else 'SAD'
+            print(f"  {ntype} {node}: E = {nd['e']:.4f} eV, "
+                  f"V = {nd['volume']:.1f}")
+
+        n_min = sum(1 for _, d in self.G.nodes(data=True)
+                    if d['xname'].startswith('M'))
+        n_sad = sum(1 for _, d in self.G.nodes(data=True)
+                    if d['xname'].startswith('S'))
+        print(f"Graph: {n_min} minima, {n_sad} saddles, "
+              f"{self.G.number_of_edges()} edges")
+
+        return best_path, best_bn
 
     def _closest_to(self, minima_list, target_fp, types):
         """Return the minimum from the list closest to target in FP space."""
