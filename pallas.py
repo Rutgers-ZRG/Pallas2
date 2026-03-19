@@ -1253,35 +1253,65 @@ class Pallas:
 
         return vunit(mode)
 
-    def _fp_guided_saddle(self, structure, mode, step_scale):
+    def _fp_guided_saddle(self, structure, mode, step_scale, n_mode_tries=3):
         """Perturb along FP gradient, then find saddle with aligned dimer.
+
+        Tries multiple initial mode directions from the same perturbed
+        structure: the FP gradient mode first, then mixed FP+random variants.
+        Returns the first converged saddle (negative curvature).
 
         Parameters
         ----------
         structure : PallasAtom — starting minimum.
         mode : np.ndarray — FP gradient mode (natom+3, 3).
         step_scale : float — perturbation magnitude.
+        n_mode_tries : int — number of different initial modes to try.
 
         Returns
         -------
-        PallasAtom — saddle point.
+        PallasAtom — saddle point (best attempt).
         """
-        atoms = cp(structure)
-        natom = len(atoms)
-        vol = atoms.get_volume()
+        natom = len(structure)
+        vol = structure.get_volume()
         jacob = (vol / natom) ** (1.0 / 3.0) * natom ** 0.5
-
-        # Perturb along FP gradient direction
-        scaled = mode * step_scale
-        cellt = atoms.get_cell() + np.dot(atoms.get_cell(), scaled[-3:] / jacob)
-        atoms.set_cell(cellt, scale_atoms=True)
-        atoms.set_positions(atoms.get_positions() + scaled[:-3])
-        atoms.invalidate_fp()
-
-        # Run dimer with FP gradient as initial mode (structure already perturbed)
         cfg = self.config
-        return cal_saddle(atoms, fmax=cfg.saddle_fmax, steps=cfg.saddle_steps,
-                          mode=mode)
+
+        # Perturb structure along FP gradient
+        perturbed = cp(structure)
+        scaled = mode * step_scale
+        cellt = perturbed.get_cell() + np.dot(perturbed.get_cell(),
+                                               scaled[-3:] / jacob)
+        perturbed.set_cell(cellt, scale_atoms=True)
+        perturbed.set_positions(perturbed.get_positions() + scaled[:-3])
+        if hasattr(perturbed, 'invalidate_fp'):
+            perturbed.invalidate_fp()
+
+        # Try multiple initial modes from this perturbed structure
+        best_saddle = None
+        best_curvature = float('inf')
+
+        for attempt in range(n_mode_tries):
+            if attempt == 0:
+                trial_mode = mode  # pure FP gradient
+            else:
+                # Mix FP gradient with random (decreasing FP weight)
+                rand = vrand(np.zeros_like(mode))
+                mix = max(0.7 - 0.3 * attempt, 0.1)
+                trial_mode = vunit(mix * mode + (1.0 - mix) * rand)
+
+            saddle = cal_saddle(cp(perturbed), fmax=cfg.saddle_fmax,
+                                steps=cfg.saddle_steps, mode=trial_mode)
+            curv = getattr(saddle, 'dimer_curvature', None)
+
+            if curv is not None and curv < best_curvature:
+                best_curvature = curv
+                best_saddle = saddle
+
+            # Stop early if we found a true saddle
+            if curv is not None and curv < 0 and saddle.converged:
+                return saddle
+
+        return best_saddle if best_saddle is not None else saddle
 
     def _saddle_escape(self, saddle, target_fp):
         """Escape saddle toward target using dimer mode + XCalculator bias.

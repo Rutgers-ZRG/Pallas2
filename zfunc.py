@@ -130,7 +130,7 @@ def cal_saddle(patoms, fmax=0.01, steps=2000, calc=None, mode=None,
         atoms.set_cell(cellt, scale_atoms=True)
         atoms.set_positions(atoms.get_positions() + mode[:-3])
 
-    d = SolidStateDimer(atoms, mode=mode, dimer_separation=0.005)
+    d = SolidStateDimer(atoms, mode=mode, dimer_separation=0.01, max_rotations=8)
 
     if optimizer == 'quickmin':
         # TSASE-style: momentum-based, requires negative curvature
