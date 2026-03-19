@@ -666,7 +666,8 @@ class SolidStateDimer:
     # resets velocity. The TSASE QuickMin maintains momentum and keeps
     # the dimer moving even through low-force regions.
 
-    def search(self, fmax=0.01, max_force_calls=100000, quiet=True):
+    def search(self, fmax=0.01, max_force_calls=100000, quiet=True,
+               logfile='ssdimer.log'):
         """Run dimer search using TSASE's QuickMin translation.
 
         Unlike FIRE, this keeps velocity-based momentum through
@@ -676,7 +677,8 @@ class SolidStateDimer:
         ----------
         fmax : float — force convergence threshold.
         max_force_calls : int — maximum number of force evaluations.
-        quiet : bool — suppress per-step output.
+        quiet : bool — suppress per-step output to stdout.
+        logfile : str or None — write per-step log (step, energy, fmax, curvature).
         """
         if self.solid_state:
             V = np.zeros((self.num_atoms + 3, 3))
@@ -685,6 +687,13 @@ class SolidStateDimer:
 
         self.converged_flag = False
         step_count = 0
+
+        # Open log file
+        flog = None
+        if logfile is not None:
+            flog = open(logfile, 'a')
+            flog.write(f"{'Step':>6s} {'Energy':>14s} {'fmax':>12s} "
+                       f"{'Curvature':>12s}\n")
 
         while self.force_evaluations < max_force_calls:
             step_count += 1
@@ -709,15 +718,27 @@ class SolidStateDimer:
             max_force = max(self._vector_magnitude(Ftrans[i])
                             for i in range(len(Ftrans)))
             curv = self.curvature if self.curvature is not None else 1.0
+            E = self.atoms.get_potential_energy()
+
+            # Log
+            if flog is not None:
+                flog.write(f"{step_count:6d} {E:14.6f} {max_force:12.6f} "
+                           f"{curv:12.6f}\n")
+                flog.flush()
 
             if not quiet and (step_count % 50 == 0 or step_count == 1):
-                E = self.atoms.get_potential_energy()
                 print(f"  dimer step {step_count}: fmax={max_force:.6f}, "
                       f"κ={curv:.4f}, E={E:.4f}")
 
             if max_force < fmax and curv < 0:
                 self.converged_flag = True
                 break
+
+        if flog is not None:
+            status = "converged" if self.converged_flag else "not converged"
+            flog.write(f"# {status} after {step_count} steps "
+                       f"({self.force_evaluations} force calls)\n")
+            flog.close()
 
         if not quiet:
             status = "converged" if self.converged_flag else "not converged"
