@@ -61,8 +61,8 @@ class PallasConfig:
     bias_steps: int = 60            # max FIRE steps for FP bias relaxation
 
     # FP-guided search parameters
-    fp_step_scale: float = 0.5      # perturbation scale along FP gradient
-    fp_push_scale: float = 0.1      # post-saddle push scale toward target
+    fp_step_scale: float = 0.05     # perturbation scale along FP gradient (small to stay near basin)
+    fp_push_scale: float = 0.05     # post-saddle push scale toward target
     max_retries: int = 2            # retries with smaller step on saddle failure
 
     # Barrier refinement parameters
