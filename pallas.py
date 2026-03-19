@@ -629,9 +629,8 @@ class Pallas:
             vol = current.get_volume()
             jacob = (vol / natom) ** (1.0 / 3.0) * natom ** 0.5
 
-            # Scale: step in FP space ≈ target_step
-            # Use a fixed geometric step in configuration space
-            scale = cfg.fp_step_scale / n_images * 5.0
+            # Constant step size calibrated to cover full A→B in n_images
+            scale = cfg.fp_step_scale / n_images
             scaled = fp_mode * scale
             cellt = current.get_cell() + np.dot(current.get_cell(),
                                                  scaled[-3:] / jacob)
@@ -699,8 +698,9 @@ class Pallas:
                              n_steps, fmax_tol):
         """Relax on real PES with FP-gradient component projected out.
 
-        This keeps the structure at approximately the same FP distance
-        from the target while minimizing the PES energy.
+        Uses FIRE with FrechetCellFilter for efficient relaxation,
+        then projects out the FP-gradient component from forces at
+        each step to keep d_fp approximately constant.
 
         Parameters
         ----------
@@ -724,6 +724,10 @@ class Pallas:
         vol = atoms.get_volume()
         jacob = (vol / natom) ** (1.0 / 3.0) * natom ** 0.5
 
+        # Use velocity Verlet / steepest descent with momentum
+        V = np.zeros((natom + 3, 3))
+        dt = 0.01
+
         for step in range(n_steps):
             forces = atoms.get_forces()
             stress = atoms.get_stress()
@@ -732,7 +736,6 @@ class Pallas:
             gen_force = np.zeros((natom + 3, 3))
             gen_force[:natom] = forces
 
-            # Stress → cell force (same as dimer convention)
             volume = -atoms.get_volume()
             st = np.zeros((3, 3))
             st[0, 0] = stress[0] * volume
@@ -747,20 +750,26 @@ class Pallas:
             proj = np.vdot(gen_force, fp_dir)
             gen_force -= proj * fp_dir
 
-            # Check convergence
-            per_row = np.array([np.linalg.norm(gen_force[i])
-                                for i in range(natom + 3)])
-            if per_row.max() < fmax_tol:
+            # Convergence check
+            per_row_max = max(np.linalg.norm(gen_force[i])
+                              for i in range(natom + 3))
+            if per_row_max < fmax_tol:
                 break
 
-            # Steepest descent step (conservative)
-            step_size = 0.02
-            step_vec = gen_force * step_size
+            # QuickMin-style velocity update (with momentum)
+            dV = gen_force * dt
+            if np.vdot(V, gen_force) > 0:
+                V = dV * (1.0 + np.vdot(dV, V) /
+                          max(np.vdot(dV, dV), 1e-10))
+            else:
+                V = dV
+
+            step_vec = V * dt
             mag = np.sqrt(np.vdot(step_vec, step_vec))
             if mag > 0.1:
                 step_vec *= 0.1 / mag
 
-            # Apply
+            # Apply displacement
             cellt = atoms.get_cell() + np.dot(atoms.get_cell(),
                                                step_vec[-3:] / jacob)
             atoms.set_cell(cellt, scale_atoms=True)
@@ -769,6 +778,219 @@ class Pallas:
         if hasattr(atoms, 'invalidate_fp'):
             atoms.invalidate_fp()
         return atoms
+
+    # ── FP-drag chain: drag + dimer refinement ──────────────────────
+
+    def run_fp_drag_chain(self, drag_images=15, relax_steps=50,
+                          relax_fmax=0.03, max_segments=10):
+        """FP-drag chain: walk toward B, find saddles, discover intermediates.
+
+        Each segment:
+        1. FP-drag from current minimum toward B until energy maximum
+        2. Dimer refinement at the maximum → true saddle
+        3. Descend from saddle → next minimum (intermediate or B)
+        4. Repeat from the new minimum
+
+        This combines fast FP-drag exploration with rigorous dimer saddles.
+        No need to reach B in one drag — each segment finds one transition.
+
+        Parameters
+        ----------
+        drag_images : int — images per FP-drag segment.
+        relax_steps : int — perpendicular relaxation steps per image.
+        relax_fmax : float — perpendicular force tolerance.
+        max_segments : int — maximum A→...→B chain segments.
+
+        Returns
+        -------
+        nx.Graph
+        """
+        cfg = self.config
+        print(f"FP-drag chain: drag_images={drag_images}, "
+              f"max_segments={max_segments}")
+
+        # Optimize endpoints
+        A = self._optimize_and_register(self.reactant, is_base=True)
+        B = self._optimize_and_register(self.product, is_base=False)
+        types = self._get_types(A)
+        fp_B = B.get_fp()
+
+        d0 = fp_distance(A.get_fp(), fp_B, types)
+        print(f"  A: H=0.0000, B: H={self.G.nodes[B.id]['e']:.4f}, "
+              f"d_fp={d0:.5f}")
+
+        current = A
+        chain = [A]
+
+        for seg in range(max_segments):
+            d_cur = fp_distance(current.get_fp(), fp_B, types)
+            ediff = abs(current.get_potential_energy()
+                        - B.get_potential_energy())
+            print(f"\n--- Segment {seg+1}/{max_segments} | "
+                  f"d_fp={d_cur:.5f}, ΔE={ediff:.5f} ---")
+
+            # Check if we've reached B
+            if d_cur < cfg.dist_threshold and ediff < cfg.ediff:
+                h_c = self.G.nodes[current.id]['e']
+                h_b = self.G.nodes[B.id]['e']
+                self.G.add_edge(current.id, B.id,
+                                weight=max(h_c, h_b), dist=d_cur)
+                print(f"  Reached B! M{current.id} ↔ M{B.id}")
+                break
+
+            # Phase 1: FP-drag from current toward B
+            print(f"  Phase 1: FP-drag ({drag_images} images)")
+            drag_result = self._fp_drag_segment(
+                current, fp_B, types, drag_images, relax_steps, relax_fmax)
+
+            if drag_result is None:
+                print(f"  FP-drag failed, stopping")
+                break
+
+            saddle_approx = drag_result['saddle_structure']
+            h_saddle_approx = drag_result['saddle_energy']
+            h_current = self.G.nodes[current.id]['e']
+            print(f"  Approximate saddle: H={h_saddle_approx:.4f} "
+                  f"(barrier={h_saddle_approx - h_current:.4f})")
+
+            # Phase 2: Dimer refinement at the energy maximum
+            print(f"  Phase 2: Dimer refinement")
+            fp_mode = self._fp_gradient_mode(saddle_approx, fp_B)
+            saddle = cal_saddle(saddle_approx, fmax=cfg.saddle_fmax,
+                                steps=cfg.saddle_steps, mode=fp_mode)
+
+            sad_id, _ = self._update_saddle(saddle)
+            saddle.id = sad_id
+            h_sad = (saddle.get_volume() * cfg.press * GPa
+                     + saddle.get_potential_energy() - self.baseenergy)
+            curv = getattr(saddle, 'dimer_curvature', None)
+            curv_str = f", κ={curv:.3f}" if curv is not None else ""
+            self.G.add_node(sad_id, xname=f'S{sad_id}', e=h_sad,
+                            volume=saddle.get_volume())
+
+            # Edge: current → saddle
+            fp_s = saddle.get_fp()
+            d_cs = fp_distance(current.get_fp(), fp_s, types)
+            self.G.add_edge(current.id, sad_id,
+                            weight=max(h_current, h_sad), dist=d_cs)
+            print(f"  Saddle S{sad_id}: H={h_sad:.4f}{curv_str}")
+
+            # Phase 3: Descend from saddle → next minimum
+            print(f"  Phase 3: Descend to next minimum")
+            escaped = self._saddle_escape(saddle, fp_B)
+            new_min = local_optimization(escaped, fmax=cfg.opt_fmax,
+                                         steps=cfg.opt_steps)
+            min_id, _ = self._update_minima(new_min)
+            new_min.id = min_id
+
+            h_min = (new_min.get_volume() * cfg.press * GPa
+                     + new_min.get_potential_energy() - self.baseenergy)
+            self.G.add_node(min_id, xname=f'M{min_id}', e=h_min,
+                            volume=new_min.get_volume())
+
+            # Edge: saddle → new minimum
+            fp_m = new_min.get_fp()
+            d_sm = fp_distance(fp_s, fp_m, types)
+            self.G.add_edge(sad_id, min_id,
+                            weight=max(h_sad, h_min), dist=d_sm)
+
+            d_new = fp_distance(fp_m, fp_B, types)
+            print(f"  New minimum M{min_id}: H={h_min:.4f}, "
+                  f"d_fp(→B)={d_new:.5f}")
+
+            chain.extend([saddle, new_min])
+            current = new_min
+            self._save_state()
+
+        # Final report
+        print(f"\nChain: {' → '.join('M'+str(s.id) if hasattr(s,'id') and self.G.nodes.get(s.id,{}).get('xname','').startswith('M') else 'S'+str(s.id) for s in chain if hasattr(s,'id'))}")
+        try:
+            path, bn = minimax_path(self.G, A.id, B.id)
+            print(f"Best path: {' → '.join(str(n) for n in path)}")
+            print(f"Bottleneck: {bn:.4f} eV ({bn/len(A):.4f} eV/atom)")
+            for node in path:
+                nd = self.G.nodes[node]
+                ntype = 'MIN' if nd['xname'].startswith('M') else 'SAD'
+                print(f"  {ntype} {node}: E = {nd['e']:.4f} eV, "
+                      f"V = {nd['volume']:.1f}")
+        except nx.NetworkXNoPath:
+            print("No complete path found")
+
+        return self.G
+
+    def _fp_drag_segment(self, start, target_fp, types,
+                         n_images, relax_steps, relax_fmax):
+        """One FP-drag segment: walk from start toward target, find E maximum.
+
+        Returns when energy starts decreasing (crossed the saddle ridge)
+        or after n_images steps.
+
+        Returns
+        -------
+        dict with saddle_structure, saddle_energy, saddle_idx, or None.
+        """
+        cfg = self.config
+        current = cp(start)
+        natom = len(current)
+
+        d_start = fp_distance(current.get_fp(), target_fp, types)
+        best_h = -float('inf')
+        best_struct = None
+        best_idx = 0
+        decline_count = 0
+
+        for i in range(n_images):
+            # FP gradient step
+            fp_mode = self._fp_gradient_mode(current, target_fp)
+            vol = current.get_volume()
+            jacob = (vol / natom) ** (1.0 / 3.0) * natom ** 0.5
+
+            scale = cfg.fp_step_scale / n_images
+            scaled = fp_mode * scale
+            cellt = current.get_cell() + np.dot(current.get_cell(),
+                                                 scaled[-3:] / jacob)
+            current.set_cell(cellt, scale_atoms=True)
+            current.set_positions(current.get_positions() + scaled[:-3])
+            if hasattr(current, 'invalidate_fp'):
+                current.invalidate_fp()
+
+            # Perpendicular relaxation
+            if relax_steps > 0:
+                current = self._perpendicular_relax(
+                    current, target_fp, types, relax_steps, relax_fmax)
+
+            # Record energy
+            h = (current.get_volume() * cfg.press * GPa
+                 + current.get_potential_energy() - self.baseenergy)
+            d = fp_distance(current.get_fp(), target_fp, types)
+            progress = 1.0 - d / max(d_start, 1e-10)
+
+            print(f"    drag {i+1}/{n_images}: H={h:.4f}, "
+                  f"d_fp={d:.5f} ({progress:.0%})")
+
+            # Track energy maximum
+            if h > best_h:
+                best_h = h
+                best_struct = cp(current)
+                best_idx = i + 1
+                decline_count = 0
+            else:
+                decline_count += 1
+
+            # Stop if energy has been declining for 3+ images
+            # (we've crossed the saddle ridge)
+            if decline_count >= 3:
+                print(f"    Energy declining — saddle at image {best_idx}")
+                break
+
+        if best_struct is None:
+            return None
+
+        return {
+            'saddle_structure': best_struct,
+            'saddle_energy': best_h,
+            'saddle_idx': best_idx,
+        }
 
     # ── FP-guided chain-growing search ────────────────────────────────
 
