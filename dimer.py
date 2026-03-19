@@ -634,16 +634,10 @@ class SolidStateDimer:
         parallel_component = np.vdot(true_forces, self.mode) * self.mode
         perpendicular_component = true_forces - parallel_component
         
-        # Calculate ratio of perpendicular component (for diagnostic purposes)
-        alpha = self._vector_magnitude(perpendicular_component) / self._vector_magnitude(true_forces)
-        print(f"Perpendicular component ratio: {alpha:.4f}")
-        print(f"Curvature: {self.curvature:.6f}")
-        
         # Dimer force modification
         if self.curvature > 0:
             # At a minimum along mode direction - invert the parallel component
             self.modified_forces = -1.0 * parallel_component
-            print("Climbing uphill along mode")
         else:
             # At a saddle point - follow perpendicular component but invert parallel
             gamma = 1.0  # Scaling factor for parallel component

@@ -35,8 +35,18 @@ def vrand(v):
 _calc = None
 
 
+def set_calculator(calc):
+    """Override the default PES calculator (MatterSim).
+
+    Call before any optimization/saddle search to use a custom calculator
+    (e.g., NequIP, MACE, or any ASE-compatible calculator).
+    """
+    global _calc
+    _calc = calc
+
+
 def _get_calculator():
-    """Lazily initialize and return MatterSim calculator."""
+    """Return the current PES calculator (lazy MatterSim if not set)."""
     global _calc
     if _calc is None:
         from mattersim.forcefield import MatterSimCalculator
