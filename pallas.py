@@ -904,18 +904,12 @@ class Pallas:
         result = {'valid': False, 'curvature': None,
                   'min_plus': None, 'min_minus': None, 'reason': ''}
 
-        # Check 1: Curvature must be negative
+        # Curvature is advisory, not a hard reject — the dimer mode
+        # may not align with the true unstable direction.
         curvature = getattr(saddle, 'dimer_curvature', None)
         result['curvature'] = curvature
 
-        if curvature is None:
-            result['reason'] = 'no curvature stored'
-            return result
-        if curvature >= 0:
-            result['reason'] = f'positive curvature ({curvature:.4f})'
-            return result
-
-        # Check 2: Push ±mode, relax, verify distinct minima
+        # Primary check: connectivity (push ±mode, relax, verify distinct minima)
         dimer_mode = getattr(saddle, 'dimer_mode', None)
         if dimer_mode is None:
             result['reason'] = 'no dimer_mode stored'
@@ -1046,7 +1040,7 @@ class Pallas:
 
             if result['valid']:
                 print(f"  S{node_id} ({node_data['e']:.4f}): "
-                      f"VALID ({curv_str})")
+                      f"VALID — connects distinct minima ({curv_str})")
                 stats['valid'] += 1
 
                 # Register the verified minima and add edges
@@ -1174,14 +1168,9 @@ class Pallas:
         self.G.add_edge(current.id, sad_id,
                         weight=max(h_cur, h_sad), dist=d_cs)
 
-        # Step 4: Validate saddle
+        # Step 4: Log saddle info (curvature is advisory, not a hard reject)
         curv = getattr(saddle, 'dimer_curvature', None)
         curv_str = f", κ={curv:.3f}" if curv is not None else ""
-
-        if curv is not None and curv >= 0:
-            print(f"  [{side}] SKIP: S{sad_id} has positive curvature "
-                  f"({curv:.4f}) — not a saddle")
-            return current
 
         if h_sad < h_cur:
             print(f"  [{side}] WARNING: saddle S{sad_id} ({h_sad:.3f}) "
