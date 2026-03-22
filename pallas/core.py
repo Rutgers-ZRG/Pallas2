@@ -72,6 +72,12 @@ class PallasConfig:
     ediff: float = 0.001            # energy diff threshold for same structure
     dist_threshold: float = 0.01    # FP distance threshold for connection
 
+    # Generational search parameters (used by run())
+    n_probes: int = 5               # probes per generation
+    max_gen: int = 50               # max generations
+    patience: int = 5               # stop after N gens without barrier improvement
+    min_barrier_change: float = 0.001  # minimum improvement to reset patience (eV)
+
 
 # ── PallasAtom: Atoms with fingerprint caching ────────────────────────
 
@@ -144,16 +150,21 @@ def fp_distance(fp1, fp2, types):
 class Pallas:
     """PALLAS pathway search engine.
 
-    Two search modes:
-    - ``run_fp_guided()`` — FP-gradient-guided chain growing (recommended)
-    - ``run_pso()`` — bidirectional PSO (legacy)
+    Primary method:
+    - ``run()`` — unified generational search (connect + refine + converge)
+
+    Advanced / legacy methods:
+    - ``run_fp_guided()`` — FP-gradient-guided chain growing
+    - ``run_pso()`` — bidirectional PSO
+    - ``refine_barrier()`` — iterative bottleneck refinement
+    - ``validate_graph()`` — saddle connectivity validation
 
     Usage::
 
-        config = PallasConfig(znucl=[6], press=10.0)
+        config = PallasConfig(znucl=[6], press=10.0, n_probes=5)
         pallas = Pallas(config)
         pallas.init_run(['POSCAR_graphite', 'POSCAR_diamond'])
-        graph = pallas.run_fp_guided()
+        path, barrier = pallas.run()
     """
 
     def __init__(self, config=None):
@@ -220,6 +231,114 @@ class Pallas:
 
         self.reactant = self.init_minima[0]
         self.product = self.init_minima[1]
+
+    # ── Unified generational search ──────────────────────────────────
+
+    def run(self):
+        """Unified pathway search: connect endpoints, then refine barrier.
+
+        Generational loop that automatically switches between two modes:
+
+        - **CONNECT**: When no A→B path exists, probes extend chains from
+          both sides toward each other (potentially through many intermediates).
+        - **REFINE**: Once connected, probes attack the bottleneck saddle
+          on the current best path, seeking lower-barrier alternatives.
+
+        Each generation launches ``n_probes`` saddle searches from
+        strategically selected frontier minima.  Probes use varying
+        FP-gradient / random mixing ratios for diversity.  All discovered
+        structures enter a shared graph; ``minimax_path`` extracts the
+        optimal route after each generation.
+
+        Stops when no barrier improvement for ``patience`` consecutive
+        generations, or ``max_gen`` generations reached.
+
+        Returns
+        -------
+        tuple : (best_path, best_barrier) or (None, inf) if no path found.
+        """
+        cfg = self.config
+        print(f"PALLAS search: n_probes={cfg.n_probes}, "
+              f"max_gen={cfg.max_gen}, patience={cfg.patience}")
+
+        # Optimize endpoints
+        A = self._optimize_and_register(self.reactant, is_base=True)
+        B = self._optimize_and_register(self.product, is_base=False)
+        types = self._get_types(A)
+        d0 = fp_distance(A.get_fp(), B.get_fp(), types)
+        print(f"Endpoints: A (M{A.id}), B (M{B.id}), d_fp={d0:.5f}")
+
+        # Track all known minima (id → PallasAtom)
+        known = {A.id: A, B.id: B}
+
+        best_barrier = float('inf')
+        best_path = None
+        stagnant = 0
+
+        for gen in range(cfg.max_gen):
+            # Check current path status
+            path_exists = False
+            try:
+                cur_path, cur_barrier = minimax_path(self.G, A.id, B.id)
+                path_exists = True
+            except nx.NetworkXNoPath:
+                pass
+
+            # Plan probes based on mode
+            if not path_exists:
+                probes = self._plan_connect_probes(A, B, known, types)
+                mode = "CONNECT"
+            else:
+                probes = self._plan_refine_probes(
+                    cur_path, A, B, known, types)
+                mode = "REFINE"
+
+            bn_str = f", barrier={best_barrier:.4f}" if best_path else ""
+            print(f"\n=== Gen {gen+1}/{cfg.max_gen} [{mode}]{bn_str} ===")
+
+            # Execute probes
+            for source, target_fp, alpha, label in probes:
+                new_min = self._fp_guided_step(
+                    source, target_fp, types,
+                    step_scale=cfg.fp_step_scale,
+                    alpha=alpha, side=label)
+                if new_min is not source and new_min.id not in known:
+                    known[new_min.id] = new_min
+
+            # Cross-connect close minima
+            self._cross_connect_all(known, types)
+
+            # Evaluate best path
+            try:
+                path, barrier = minimax_path(self.G, A.id, B.id)
+                if barrier < best_barrier - cfg.min_barrier_change:
+                    old = best_barrier
+                    best_barrier = barrier
+                    best_path = path
+                    stagnant = 0
+                    if old < float('inf'):
+                        print(f"  NEW BEST: barrier={barrier:.4f} "
+                              f"(improved by {old - barrier:.4f})")
+                    else:
+                        print(f"  FIRST PATH: barrier={barrier:.4f}")
+                else:
+                    if path_exists:
+                        stagnant += 1
+                    print(f"  barrier={barrier:.4f} "
+                          f"(stagnant {stagnant}/{cfg.patience})")
+            except nx.NetworkXNoPath:
+                print(f"  No path yet")
+
+            self._save_state()
+
+            if path_exists and stagnant >= cfg.patience:
+                print(f"\nConverged: no improvement for "
+                      f"{cfg.patience} generations")
+                break
+
+        # Final report
+        self._report_result(best_path, best_barrier, A, known)
+        return best_path, best_barrier
 
     # ── PSO core ─────────────────────────────────────────────────────
 
@@ -1558,6 +1677,235 @@ class Pallas:
                                     weight=max(h_a, h_b), dist=d)
                     print(f"  CONNECT: M{ma.id} ↔ M{mb.id} "
                           f"(d={d:.5f})")
+
+    # ── Generational search helpers ──────────────────────────────────
+
+    def _plan_connect_probes(self, A, B, known, types):
+        """Plan probes to extend chains from both sides toward each other.
+
+        Classifies known minima into A-reachable and B-reachable sets,
+        ranks each side's frontier by closeness to the other side,
+        and distributes probes round-robin across the top frontier tips.
+
+        Returns list of (source, target_fp, alpha, label) tuples.
+        """
+        cfg = self.config
+
+        # Classify minima by graph connectivity
+        A_ids, B_ids = self._classify_sides(A.id, B.id)
+
+        # Rank each side's frontier by closeness to other side
+        A_frontier = self._rank_frontier(A_ids, B_ids, known, types)
+        B_frontier = self._rank_frontier(B_ids, A_ids, known, types)
+
+        if not A_frontier or not B_frontier:
+            return []
+
+        probes = []
+        for i in range(cfg.n_probes):
+            alpha = max(1.0 - 0.3 * (i // 2), 0.1)
+            if i % 2 == 0:
+                # A-side probe — round-robin across frontier tips
+                idx = (i // 2) % len(A_frontier)
+                src_id, tgt_fp, d = A_frontier[idx]
+                probes.append((
+                    known[src_id], tgt_fp, alpha,
+                    f'A→B p{i}(α={alpha:.1f},d={d:.3f})'))
+            else:
+                idx = (i // 2) % len(B_frontier)
+                src_id, tgt_fp, d = B_frontier[idx]
+                probes.append((
+                    known[src_id], tgt_fp, alpha,
+                    f'B→A p{i}(α={alpha:.1f},d={d:.3f})'))
+
+        return probes
+
+    def _plan_refine_probes(self, path, A, B, known, types):
+        """Plan probes to attack the bottleneck on the current best path.
+
+        Finds the highest-energy saddle, identifies its flanking minima,
+        and launches probes from both sides of the bottleneck toward each
+        other with varying FP/random mixing.
+
+        Falls back to connect-style probes if no saddle found on path.
+
+        Returns list of (source, target_fp, alpha, label) tuples.
+        """
+        cfg = self.config
+
+        # Find the worst saddle on the path
+        worst_id, worst_idx = None, -1
+        worst_e = -float('inf')
+        for i, node in enumerate(path):
+            nd = self.G.nodes[node]
+            if nd['xname'].startswith('S') and nd['e'] > worst_e:
+                worst_e = nd['e']
+                worst_id = node
+                worst_idx = i
+
+        if worst_id is None:
+            # No saddle on path — fall back to connect probes
+            return self._plan_connect_probes(A, B, known, types)
+
+        # Find flanking minima
+        min_left = self._find_flanking_min(path, worst_idx, -1, known)
+        min_right = self._find_flanking_min(path, worst_idx, +1, known)
+
+        if min_left is None or min_right is None:
+            return self._plan_connect_probes(A, B, known, types)
+
+        h_left = self.G.nodes[min_left.id]['e']
+        h_right = self.G.nodes[min_right.id]['e']
+        print(f"  Bottleneck: S{worst_id} ({worst_e:.4f}), "
+              f"flanked by M{min_left.id} ({h_left:.4f}) "
+              f"↔ M{min_right.id} ({h_right:.4f})")
+
+        probes = []
+        for i in range(cfg.n_probes):
+            alpha = max(1.0 - 0.2 * i, 0.1)
+            if i % 2 == 0:
+                probes.append((
+                    min_left, min_right.get_fp(), alpha,
+                    f'refine fwd p{i}(α={alpha:.1f})'))
+            else:
+                probes.append((
+                    min_right, min_left.get_fp(), alpha,
+                    f'refine rev p{i}(α={alpha:.1f})'))
+
+        return probes
+
+    def _classify_sides(self, A_id, B_id):
+        """Classify minimum nodes into A-reachable and B-reachable sets."""
+        if A_id in self.G:
+            A_comp = nx.node_connected_component(self.G, A_id)
+        else:
+            A_comp = {A_id}
+        if B_id in self.G:
+            B_comp = nx.node_connected_component(self.G, B_id)
+        else:
+            B_comp = {B_id}
+
+        A_mins = {n for n in A_comp
+                  if self.G.nodes.get(n, {}).get('xname', '').startswith('M')}
+        B_mins = {n for n in B_comp
+                  if self.G.nodes.get(n, {}).get('xname', '').startswith('M')}
+        return A_mins, B_mins
+
+    def _rank_frontier(self, source_ids, target_ids, known, types):
+        """Rank source minima by closeness to nearest target minimum.
+
+        Returns list of (source_id, nearest_target_fp, distance)
+        sorted by distance (closest first).
+        """
+        ranked = []
+        for sid in source_ids:
+            if sid not in known:
+                continue
+            fp_s = known[sid].get_fp()
+            best_d = float('inf')
+            best_tgt_fp = None
+            for tid in target_ids:
+                if tid not in known:
+                    continue
+                fp_t = known[tid].get_fp()
+                d = fp_distance(fp_s, fp_t, types)
+                if d < best_d:
+                    best_d = d
+                    best_tgt_fp = fp_t
+            if best_tgt_fp is not None:
+                ranked.append((sid, best_tgt_fp, best_d))
+        ranked.sort(key=lambda x: x[2])
+        return ranked
+
+    def _find_flanking_min(self, path, saddle_idx, direction, known):
+        """Find the nearest minimum in the given direction from a saddle.
+
+        Parameters
+        ----------
+        path : list of node IDs.
+        saddle_idx : int — index of the saddle node in the path.
+        direction : int — -1 for left, +1 for right.
+        known : dict — id → PallasAtom cache.
+
+        Returns PallasAtom or None.
+        """
+        i = saddle_idx + direction
+        while 0 <= i < len(path):
+            if self.G.nodes[path[i]]['xname'].startswith('M'):
+                return self._ensure_known(path[i], known)
+            i += direction
+        return None
+
+    def _ensure_known(self, mid, known):
+        """Ensure a minimum is in the known dict; load from DB if needed."""
+        if mid in known:
+            return known[mid]
+
+        cfg = self.config
+        try:
+            row = self.db.get(id=mid)
+            pa = PallasAtom(self.db.get_atoms(mid))
+            pa.znucl = cfg.znucl
+            pa.fpcutoff = cfg.fpcutoff
+            pa.natx = cfg.natx
+            pa.id = mid
+            pa.fp = np.array(row.data['fp'])
+            known[mid] = pa
+            return pa
+        except Exception:
+            return None
+
+    def _cross_connect_all(self, known, types):
+        """Check all pairs of known minima for close FP distance."""
+        cfg = self.config
+        ids = [mid for mid in known
+               if mid in self.G
+               and self.G.nodes[mid].get('xname', '').startswith('M')]
+
+        for i in range(len(ids)):
+            for j in range(i + 1, len(ids)):
+                a_id, b_id = ids[i], ids[j]
+                if self.G.has_edge(a_id, b_id):
+                    continue
+                d = fp_distance(
+                    known[a_id].get_fp(), known[b_id].get_fp(), types)
+                ediff = abs(known[a_id].get_potential_energy()
+                            - known[b_id].get_potential_energy())
+                if d < cfg.dist_threshold and ediff < cfg.ediff:
+                    h_a = self.G.nodes[a_id]['e']
+                    h_b = self.G.nodes[b_id]['e']
+                    self.G.add_edge(a_id, b_id,
+                                    weight=max(h_a, h_b), dist=d)
+                    print(f"  CONNECT: M{a_id} ↔ M{b_id} (d={d:.5f})")
+
+    def _report_result(self, best_path, best_barrier, A, known):
+        """Print final search results."""
+        n_min = sum(1 for _, d in self.G.nodes(data=True)
+                    if d.get('xname', '').startswith('M'))
+        n_sad = sum(1 for _, d in self.G.nodes(data=True)
+                    if d.get('xname', '').startswith('S'))
+
+        print(f"\n{'='*60}")
+        print(f"Search complete: {n_min} minima, {n_sad} saddles, "
+              f"{self.G.number_of_edges()} edges")
+        print(f"Known minima explored: {len(known)}")
+
+        if best_path:
+            print(f"\nBest path: {' -> '.join(str(n) for n in best_path)}")
+            print(f"Barrier: {best_barrier:.4f} eV")
+            nat = len(A)
+            if nat > 1:
+                print(f"         {best_barrier/nat:.4f} eV/atom")
+            for node in best_path:
+                nd = self.G.nodes[node]
+                ntype = 'MIN' if nd['xname'].startswith('M') else 'SAD'
+                print(f"  {ntype} {node}: H={nd['e']:.4f} eV, "
+                      f"V={nd['volume']:.1f} A^3")
+        else:
+            print("\nNo complete path found")
+        print(f"{'='*60}")
+
+    # ── FP-guided step (probe core) ──────────────────────────────────
 
     def _fp_guided_step(self, current, target_fp, types,
                         step_scale, alpha=1.0, side=""):

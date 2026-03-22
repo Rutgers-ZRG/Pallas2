@@ -49,71 +49,86 @@ export PYTHONPATH=/path/to/Pallas2:$PYTHONPATH
 ## Quick Start
 
 ```python
-from ase.io import read
 from pallas import Pallas, PallasConfig
 
 # Configure
 config = PallasConfig(
     znucl=[6],          # carbon
     press=10.0,         # external pressure in eV/A^3
-    maxstep=20,         # max search iterations
-    opt_fmax=0.001,     # force convergence for local optimization
-    saddle_fmax=0.01,   # force convergence for dimer
+    n_probes=5,         # probes per generation
+    max_gen=50,         # max generations
+    patience=5,         # stop after N gens without improvement
 )
 
 # Initialize with endpoint structures (VASP POSCAR format)
 pallas = Pallas(config)
 pallas.init_run(['POSCAR_graphite', 'POSCAR_diamond'])
 
-# Run search
-graph = pallas.run_fp_guided(n_probes=3)
-
-# Find the minimum-barrier path
-path, barrier = pallas.find_best_path()
+# Run unified search (connect + refine + converge)
+path, barrier = pallas.run()
 ```
 
-## Recommended Pipeline
+## How `run()` Works
+
+The unified search loop automatically switches between two modes:
+
+```
+for each generation:
+    if no A→B path exists in graph:
+        CONNECT — launch probes from frontier tips toward the other side
+    else:
+        REFINE  — launch probes to attack the bottleneck saddle
+
+    register all new minima/saddles in graph
+    re-evaluate minimax path
+
+    if no improvement for `patience` generations:
+        stop
+```
+
+**CONNECT mode**: Probes grow chains from both sides (A→ and ←B).
+Multiple frontier tips are ranked by FP distance to the other side,
+and probes are distributed round-robin across the best tips.
+This naturally handles paths with many intermediates (A → I1 → I2 → ... → B).
+
+**REFINE mode**: Identifies the highest-energy saddle (bottleneck) on
+the current best path, finds its flanking minima, and launches probes
+from both sides of the bottleneck toward each other.  All new structures
+enter the graph; minimax re-evaluation may find a lower-barrier route.
+
+## Optional Post-Processing
+
+After `run()` completes, you can optionally validate saddle points:
 
 ```python
-# 1. Multi-probe FP-guided search (primary discovery)
-graph = pallas.run_fp_guided(n_probes=3)
-
-# 2. Iterative barrier refinement (attack the bottleneck)
-best_path, best_barrier = pallas.refine_barrier(n_rounds=3, n_probes=5)
-
-# 3. Validate saddle points (connectivity check)
+# Validate saddle connectivity (push ±mode → distinct minima)
 stats = pallas.validate_graph()
 
-# 4. Extract optimal pathway
+# Re-extract path after validation
 path, barrier = pallas.find_best_path()
 ```
 
 ## Search Methods
 
-### `run_fp_guided(n_probes=1)` — Recommended
+### `run()` — Recommended
 
-Bidirectional FP-gradient-guided chain-growing search. At each step:
+Unified generational search that combines connection and refinement in one loop. See "How `run()` Works" above.
 
-1. **FP-drag**: Walks from the current chain tip toward the target in fingerprint space, with perpendicular PES relaxation, to locate the approximate saddle region (energy maximum along the path)
+Each probe within a generation does:
+
+1. **FP-drag**: Walks from the source minimum toward the target in fingerprint space, with perpendicular PES relaxation, to locate the approximate saddle region (energy maximum)
 2. **Dimer refinement**: Runs the solid-state dimer method at the approximate saddle to find the true transition state
 3. **Saddle escape**: Pushes along the dimer's unstable mode toward the target, then relaxes to the next minimum
 
-Multiple probes per step use varying FP/random mixing ratios to explore diverse pathways. All discovered structures feed into a single graph.
+Probes use varying FP-gradient / random mixing ratios (alpha schedule) for diversity within each generation.
 
-### `run_pso()` — Legacy
+### `run_fp_guided(n_probes=1)` — Advanced
 
-Bidirectional particle swarm optimization. Particles on both sides are driven toward each other, with saddle searches at each step. Less directed than `run_fp_guided` but can discover unexpected intermediates.
-
-### `refine_barrier(n_rounds, n_probes)`
-
-Iteratively improves the current best path by:
-1. Finding the highest-energy saddle (bottleneck) on the minimax path
-2. Launching targeted searches between the flanking minima
-3. Re-evaluating the best path after each round
+Single-pass FP-gradient-guided chain growing without generational convergence. Useful for quick exploration or debugging.
 
 ### `validate_graph()`
 
-Tests each saddle point by pushing along +/- dimer mode and relaxing to verify that the saddle connects two distinct minima. Invalid saddles are pruned from the graph.
+Post-processing: tests each saddle by pushing along +/- dimer mode and relaxing, verifying the saddle connects two distinct minima. Prunes invalid saddles.
 
 ## Using a Custom Calculator
 
@@ -141,21 +156,27 @@ set_calculator(mace_mp(default_dtype='float64'))
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
+| **System** | | |
 | `znucl` | `[]` | Atomic numbers in type order (e.g., `[6]` for C, `[11, 17]` for NaCl) |
 | `press` | `0.0` | External pressure (eV/A^3) |
+| **Fingerprint** | | |
 | `fpcutoff` | `5.5` | Fingerprint cutoff radius (A) |
 | `natx` | `200` | Max neighbors per atom (fingerprint dimension) |
-| `maxstep` | `50` | Max search iterations |
-| `popsize` | `10` | PSO population size |
+| **Search (`run()`)** | | |
+| `n_probes` | `5` | Probes per generation |
+| `max_gen` | `50` | Max generations |
+| `patience` | `5` | Stop after N gens without barrier improvement |
+| `min_barrier_change` | `0.001` | Minimum improvement to reset patience (eV) |
+| **Optimization** | | |
 | `opt_steps` | `2000` | Max FIRE steps for local optimization |
 | `opt_fmax` | `0.001` | Force convergence for optimization (eV/A) |
 | `saddle_steps` | `2000` | Max steps for dimer saddle search |
 | `saddle_fmax` | `0.01` | Force convergence for saddle (eV/A) |
 | `bias_steps` | `60` | Max steps for FP bias relaxation |
+| **FP-guided parameters** | | |
 | `fp_step_scale` | `0.05` | Perturbation scale along FP gradient |
 | `fp_push_scale` | `0.05` | Post-saddle push scale toward target |
-| `refine_rounds` | `3` | Barrier refinement iterations |
-| `refine_probes` | `5` | Saddle searches per refinement round |
+| **Convergence** | | |
 | `ediff` | `0.001` | Energy threshold for structure deduplication (eV) |
 | `dist_threshold` | `0.01` | FP distance threshold for connection |
 
