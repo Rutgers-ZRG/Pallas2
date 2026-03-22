@@ -15,8 +15,8 @@ from pallas import Pallas, PallasConfig
 t0 = time.time()
 
 calc = NequIPDualCalc(
-    ef_model_path='/Users/li/dev/Pallas2/model/cdse_energy_force_model.pth',
-    stress_model_path='/Users/li/dev/Pallas2/model/cdse_stress_model.pth')
+    ef_model_path='/Users/li/dev/Pallas2/tests/cdse/model/cdse_energy_force_model.pth',
+    stress_model_path='/Users/li/dev/Pallas2/tests/cdse/model/cdse_stress_model.pth')
 set_calculator(calc)
 print("Using NequIP CdSe model")
 
