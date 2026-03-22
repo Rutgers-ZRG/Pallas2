@@ -2102,12 +2102,14 @@ class Pallas:
         return best_saddle if best_saddle is not None else saddle
 
     def _saddle_escape(self, saddle, target_fp):
-        """Escape saddle toward target using dimer mode + XCalculator bias.
+        """Escape saddle toward target using dimer mode push only.
 
-        Two-step descent:
-        1. Push along the dimer's unstable mode in the direction toward target
-           (this crosses the saddle barrier into the next basin)
-        2. Run XCalculator bias to drive further toward target in FP space
+        Pushes along the dimer's unstable mode in the direction toward
+        the target (determined by projecting the FP gradient onto the
+        dimer mode).  No non-physical FP bias is applied — after the push,
+        the caller should relax on the real PES via local_optimization,
+        which naturally flows to the nearest minimum without skipping
+        intermediate barriers.
 
         Parameters
         ----------
@@ -2116,7 +2118,7 @@ class Pallas:
 
         Returns
         -------
-        PallasAtom — structure on the target side of the saddle.
+        PallasAtom — structure pushed to the target side of the saddle.
         """
         atoms = cp(saddle)
         natom = len(atoms)
@@ -2136,21 +2138,12 @@ class Pallas:
         push_dir = vunit(dimer_mode) * np.sign(dot) if abs(dot) > 1e-12 \
             else vunit(fp_mode)
 
-        # Step 1: Push along dimer mode (larger step to cross the saddle)
-        push_scale = self.config.fp_push_scale * 3.0  # stronger than FP push
+        # Push along dimer mode to cross the saddle ridge
+        push_scale = self.config.fp_push_scale * 3.0
         scaled = push_dir * push_scale
         cellt = atoms.get_cell() + np.dot(atoms.get_cell(), scaled[-3:] / jacob)
         atoms.set_cell(cellt, scale_atoms=True)
         atoms.set_positions(atoms.get_positions() + scaled[:-3])
-
-        # Step 2: XCalculator bias toward target (proven to work)
-        calc = XCalculator(
-            fp0=target_fp, znucl=self.config.znucl,
-            cutoff=self.config.fpcutoff, natx=self.config.natx)
-        atoms.calc = calc
-        af = FrechetCellFilter(atoms)
-        opt = FIRE(af, maxstep=0.1, logfile='xcal_escape.log')
-        opt.run(fmax=0.01, steps=self.config.bias_steps)
 
         if hasattr(atoms, 'invalidate_fp'):
             atoms.invalidate_fp()
