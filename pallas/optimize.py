@@ -12,7 +12,7 @@ from ase.io import read, write, Trajectory
 from ase.optimize import FIRE, BFGS
 from ase.filters import FrechetCellFilter
 
-from dimer import SolidStateDimer
+from pallas.dimer import SolidStateDimer
 
 
 # ── Vector utilities ──────────────────────────────────────────────────

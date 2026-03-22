@@ -27,9 +27,9 @@ import ase.db
 
 import torch
 import torch_fplib
-from xcal import XCalculator, atoms_to_cell, fp_dist_with_assignment
-from zfunc import local_optimization, cal_saddle, vunit, vrand, _get_calculator
-from barrier import minimax_path
+from pallas.xcal import XCalculator, atoms_to_cell, fp_dist_with_assignment
+from pallas.optimize import local_optimization, cal_saddle, vunit, vrand, _get_calculator
+from pallas.graph import minimax_path
 
 
 # ── Configuration ─────────────────────────────────────────────────────
