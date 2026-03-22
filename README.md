@@ -1,6 +1,6 @@
 # PALLAS
 
-**P**hase Transition P**A**thway Samp**L**ing via Swarm Inte**L**igence **A**nd Graph Theory
+**P**h**A**se Transition **L**andscape Exp**L**oration with **A**utomated **S**addle Search
 
 PALLAS is an automated method for discovering transition pathways between crystal phases. Given two endpoint structures (e.g., graphite and diamond), it builds a graph of minima and saddle points on the potential energy surface, then extracts the lowest-barrier pathway via minimax optimization.
 

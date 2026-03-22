@@ -1,13 +1,12 @@
-"""PALLAS — Phase Transition Pathway Sampling via Swarm Intelligence and Graph Theory.
+"""PALLAS — Phase Transition Landscape Exploration with Automated Saddle Search.
 
 Automated method for finding transition pathways between crystal phases using:
 - FP-gradient-guided chain-growing search (primary method)
-- Bidirectional PSO search (legacy method)
 - Solid-state dimer method for saddle point location
 - NetworkX graph with minimax bottleneck path finding
 - torch_fplib GOM fingerprints for structural distance and gradients
 
-Dependencies: torch_fplib, MatterSim (via zfunc), ASE, NetworkX.
+Dependencies: torch_fplib, ASE, NetworkX, joblib, scipy.
 """
 
 import os

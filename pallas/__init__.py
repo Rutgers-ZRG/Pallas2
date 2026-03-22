@@ -1,4 +1,4 @@
-"""PALLAS — Phase Transition Pathway Sampling via Swarm Intelligence and Graph Theory."""
+"""PALLAS — Phase Transition Landscape Exploration with Automated Saddle Search."""
 
 from pallas.core import Pallas, PallasConfig, PallasAtom
 from pallas.xcal import XCalculator, atoms_to_cell, fp_dist_with_assignment
