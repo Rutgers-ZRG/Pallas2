@@ -691,7 +691,7 @@ class SolidStateDimer:
         # Open log file
         flog = None
         if logfile is not None:
-            flog = open(logfile, 'a')
+            flog = open(logfile, 'a', encoding='utf-8')
             flog.write(f"{'Step':>6s} {'Energy':>14s} {'fmax':>12s} "
                        f"{'Curvature':>12s}\n")
 

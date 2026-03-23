@@ -43,7 +43,7 @@ class PallasConfig:
 
     # System
     znucl: list = field(default_factory=list)   # atomic numbers in type order
-    press: float = 0.0                          # external pressure (eV/Å³)
+    press: float = 0.0                          # external pressure (GPa)
 
     # PSO parameters
     maxstep: int = 50
@@ -69,8 +69,8 @@ class PallasConfig:
     refine_probes: int = 5          # saddle searches per refinement round
 
     # Convergence
-    ediff: float = 0.001            # energy diff threshold for same structure
-    dist_threshold: float = 0.01    # FP distance threshold for connection
+    ediff: float = 0.005            # energy diff threshold per atom (eV/atom)
+    dist_threshold: float = 0.005   # FP distance threshold for same structure
 
     # Generational search parameters (used by run())
     n_probes: int = 5               # probes per generation
@@ -235,20 +235,19 @@ class Pallas:
     # ── Unified generational search ──────────────────────────────────
 
     def run(self):
-        """Unified pathway search: connect endpoints, then refine barrier.
+        """Unified pathway search: connect, then hybrid refine+explore.
 
-        Generational loop that automatically switches between two modes:
+        Generational loop with three modes:
 
-        - **CONNECT**: When no A→B path exists, probes extend chains from
-          both sides toward each other (potentially through many intermediates).
-        - **REFINE**: Once connected, probes attack the bottleneck saddle
-          on the current best path, seeking lower-barrier alternatives.
+        - **CONNECT**: When no A→B path exists, all probes extend chains
+          from both sides toward each other.
+        - **HYBRID**: Once connected, probes split between refining the
+          bottleneck saddle and exploring from frontier intermediates to
+          discover alternative pathways through new phases.
 
-        Each generation launches ``n_probes`` saddle searches from
-        strategically selected frontier minima.  Probes use varying
-        FP-gradient / random mixing ratios for diversity.  All discovered
-        structures enter a shared graph; ``minimax_path`` extracts the
-        optimal route after each generation.
+        Each generation launches ``n_probes`` saddle searches.  All
+        discovered structures enter a shared graph; ``minimax_path``
+        extracts the optimal route after each generation.
 
         Stops when no barrier improvement for ``patience`` consecutive
         generations, or ``max_gen`` generations reached.
@@ -289,9 +288,9 @@ class Pallas:
                 probes = self._plan_connect_probes(A, B, known, types)
                 mode = "CONNECT"
             else:
-                probes = self._plan_refine_probes(
+                probes = self._plan_hybrid_probes(
                     cur_path, A, B, known, types)
-                mode = "REFINE"
+                mode = "HYBRID"
 
             bn_str = f", barrier={best_barrier:.4f}" if best_path else ""
             print(f"\n=== Gen {gen+1}/{cfg.max_gen} [{mode}]{bn_str} ===")
@@ -438,6 +437,7 @@ class Pallas:
                  + opt.get_potential_energy() - self.baseenergy)
 
         self.G.add_node(idm, xname=f'M{idm}', e=h, volume=opt.get_volume())
+        self._save_to_traj(opt, idm, 'minima', h)
         print(f"Registered {'base' if is_base else 'target'}: "
               f"ID={idm}, H={h:.4f} eV")
         return opt
@@ -473,13 +473,20 @@ class Pallas:
                      + saddle.get_potential_energy() - self.baseenergy)
             self.G.add_node(sad_id, xname=f'S{sad_id}', e=h_sad,
                             volume=saddle.get_volume())
+            self._save_to_traj(saddle, sad_id, 'saddle', h_sad)
 
-            # Edge: anchor → saddle
+            # Edge: anchor → saddle (only if saddle is higher)
             fp_a = anchor_opt.get_fp()
             fp_s = saddle.get_fp()
             fp_dist = fp_distance(fp_a, fp_s, types)
-            edge_w = max(self.G.nodes[anchor_id]['e'], h_sad)
-            self.G.add_edge(anchor_id, sad_id, weight=edge_w, dist=fp_dist)
+            h_anchor = self.G.nodes[anchor_id]['e']
+            if h_sad > h_anchor:
+                self.G.add_edge(anchor_id, sad_id,
+                                weight=max(h_anchor, h_sad), dist=fp_dist)
+            else:
+                print(f"  [{side} p{particle_idx}] Skipping edge "
+                      f"M{anchor_id}→S{sad_id}: saddle ({h_sad:.4f}) "
+                      f"≤ minimum ({h_anchor:.4f})")
 
             # Bias saddle toward target, then optimize
             cfg = self.config
@@ -493,12 +500,18 @@ class Pallas:
                      + new_min.get_potential_energy() - self.baseenergy)
             self.G.add_node(min_id, xname=f'M{min_id}', e=h_min,
                             volume=new_min.get_volume())
+            self._save_to_traj(new_min, min_id, 'minima', h_min)
 
-            # Edge: saddle → new minimum
+            # Edge: saddle → new minimum (only if saddle is higher)
             fp_m = new_min.get_fp()
             fp_dist2 = fp_distance(fp_s, fp_m, types)
-            edge_w2 = max(h_sad, h_min)
-            self.G.add_edge(sad_id, min_id, weight=edge_w2, dist=fp_dist2)
+            if h_sad > h_min:
+                self.G.add_edge(sad_id, min_id, weight=max(h_sad, h_min),
+                                dist=fp_dist2)
+            else:
+                print(f"  [{side} p{particle_idx}] Skipping edge "
+                      f"S{sad_id}→M{min_id}: saddle ({h_sad:.4f}) "
+                      f"≤ minimum ({h_min:.4f})")
 
             print(f"  [{side} p{particle_idx}] saddle S{sad_id} "
                   f"({h_sad:.3f}) → min M{min_id} ({h_min:.3f})")
@@ -525,7 +538,7 @@ class Pallas:
                 try:
                     d = fp_distance(fp_r, fp_p, types)
                     ediff = abs(mr.get_potential_energy()
-                                - mp.get_potential_energy())
+                                - mp.get_potential_energy()) / len(mr)
 
                     if d < self.config.dist_threshold and ediff < self.config.ediff:
                         # Close enough — add connecting edge
@@ -687,453 +700,6 @@ class Pallas:
         opt.run(fmax=0.01, steps=self.config.bias_steps)
         return atoms
 
-    # ── FP-drag: constrained walk along FP coordinate ───────────────
-
-    def run_fp_drag(self, n_images=20, relax_steps=30, relax_fmax=0.05):
-        """Drag structure from A to B along the FP distance coordinate.
-
-        At each image:
-        1. Take a step along the FP gradient (decrease d_fp toward B)
-        2. Relax perpendicular DOFs on the real PES (constrained relaxation)
-        3. Record the PES energy
-
-        The energy maximum along the path is the approximate saddle.
-        Optionally followed by dimer refinement at the maximum.
-
-        Parameters
-        ----------
-        n_images : int — number of intermediate images.
-        relax_steps : int — perpendicular relaxation steps per image.
-        relax_fmax : float — force threshold for perpendicular relaxation.
-
-        Returns
-        -------
-        dict with keys:
-            images : list of PallasAtom
-            energies : list of float (PES enthalpy)
-            fp_dists : list of float (FP distance to B)
-            barrier : float (max energy - min(E_A, E_B))
-            saddle_idx : int (index of approximate saddle)
-        """
-        cfg = self.config
-        print(f"FP-drag: {n_images} images, relax_steps={relax_steps}")
-
-        # Optimize endpoints
-        A = self._optimize_and_register(self.reactant, is_base=True)
-        B = self._optimize_and_register(self.product, is_base=False)
-        types = self._get_types(A)
-        fp_B = B.get_fp()
-
-        d0 = fp_distance(A.get_fp(), fp_B, types)
-        h_A = 0.0
-        h_B = (B.get_volume() * cfg.press * GPa
-               + B.get_potential_energy() - self.baseenergy)
-
-        print(f"  A: H={h_A:.4f} eV, B: H={h_B:.4f} eV, d_fp={d0:.5f}")
-
-        current = cp(A)
-        images = [cp(A)]
-        enthalpies = [h_A]
-        fp_dists = [d0]
-
-        for i in range(n_images):
-            # Step size: adaptive (equal steps in FP distance)
-            d_current = fp_distance(current.get_fp(), fp_B, types)
-            target_step = d0 / n_images
-
-            # 1. FP gradient step toward B
-            fp_mode = self._fp_gradient_mode(current, fp_B)
-            natom = len(current)
-            vol = current.get_volume()
-            jacob = (vol / natom) ** (1.0 / 3.0) * natom ** 0.5
-
-            # Constant step size calibrated to cover full A→B in n_images
-            scale = cfg.fp_step_scale / n_images
-            scaled = fp_mode * scale
-            cellt = current.get_cell() + np.dot(current.get_cell(),
-                                                 scaled[-3:] / jacob)
-            current.set_cell(cellt, scale_atoms=True)
-            current.set_positions(current.get_positions() + scaled[:-3])
-            if hasattr(current, 'invalidate_fp'):
-                current.invalidate_fp()
-
-            # 2. Perpendicular relaxation on real PES
-            if relax_steps > 0:
-                current = self._perpendicular_relax(
-                    current, fp_B, types, relax_steps, relax_fmax)
-
-            # 3. Record
-            h = (current.get_volume() * cfg.press * GPa
-                 + current.get_potential_energy() - self.baseenergy)
-            d = fp_distance(current.get_fp(), fp_B, types)
-            enthalpies.append(h)
-            fp_dists.append(d)
-            images.append(cp(current))
-
-            progress = 1.0 - d / max(d0, 1e-10)
-            print(f"  image {i+1}/{n_images}: H={h:.4f} eV, "
-                  f"d_fp={d:.5f}, progress={progress:.1%}")
-
-        # Find approximate saddle (energy maximum)
-        saddle_idx = int(np.argmax(enthalpies))
-        barrier = enthalpies[saddle_idx] - min(h_A, h_B)
-
-        print(f"\nFP-drag complete:")
-        print(f"  Barrier ≈ {barrier:.4f} eV ({barrier/4:.4f} eV/f.u.)")
-        print(f"  Saddle at image {saddle_idx}/{n_images} "
-              f"(H={enthalpies[saddle_idx]:.4f})")
-        print(f"  FP progress: {fp_dists[0]:.5f} → {fp_dists[-1]:.5f}")
-
-        # Register saddle structure in graph
-        if saddle_idx > 0 and saddle_idx < len(images) - 1:
-            saddle_struct = images[saddle_idx]
-            sad_id, _ = self._update_saddle(saddle_struct)
-            saddle_struct.id = sad_id
-            self.G.add_node(sad_id, xname=f'S{sad_id}',
-                            e=enthalpies[saddle_idx],
-                            volume=saddle_struct.get_volume())
-
-            # Edges to nearest minima in the path
-            A_id = self.init_minima[0].id
-            B_id = self.init_minima[1].id
-            self.G.add_edge(A_id, sad_id,
-                            weight=max(h_A, enthalpies[saddle_idx]),
-                            dist=fp_dists[saddle_idx])
-            self.G.add_edge(sad_id, B_id,
-                            weight=max(enthalpies[saddle_idx], h_B),
-                            dist=fp_dists[saddle_idx])
-            self._save_state()
-
-        return {
-            'images': images,
-            'energies': enthalpies,
-            'fp_dists': fp_dists,
-            'barrier': barrier,
-            'saddle_idx': saddle_idx,
-        }
-
-    def _perpendicular_relax(self, structure, target_fp, types,
-                             n_steps, fmax_tol):
-        """Relax on real PES with FP-gradient component projected out.
-
-        Uses FIRE with FrechetCellFilter for efficient relaxation,
-        then projects out the FP-gradient component from forces at
-        each step to keep d_fp approximately constant.
-
-        Parameters
-        ----------
-        structure : PallasAtom
-        target_fp : np.ndarray — target fingerprints.
-        types : np.ndarray
-        n_steps : int — max relaxation steps.
-        fmax_tol : float — perpendicular force convergence.
-
-        Returns
-        -------
-        PallasAtom — relaxed structure.
-        """
-        atoms = structure
-        atoms.calc = _get_calculator()
-
-        # FP gradient direction (unit vector in generalized space)
-        fp_dir = self._fp_gradient_mode(atoms, target_fp)
-
-        natom = len(atoms)
-        vol = atoms.get_volume()
-        jacob = (vol / natom) ** (1.0 / 3.0) * natom ** 0.5
-
-        # Use velocity Verlet / steepest descent with momentum
-        V = np.zeros((natom + 3, 3))
-        dt = 0.01
-
-        for step in range(n_steps):
-            forces = atoms.get_forces()
-            stress = atoms.get_stress()
-
-            # Build generalized force (natom+3, 3)
-            gen_force = np.zeros((natom + 3, 3))
-            gen_force[:natom] = forces
-
-            volume = -atoms.get_volume()
-            st = np.zeros((3, 3))
-            st[0, 0] = stress[0] * volume
-            st[1, 1] = stress[1] * volume
-            st[2, 2] = stress[2] * volume
-            st[2, 1] = stress[3] * volume
-            st[2, 0] = stress[4] * volume
-            st[1, 0] = stress[5] * volume
-            gen_force[-3:] = st / jacob
-
-            # Project out FP gradient component
-            proj = np.vdot(gen_force, fp_dir)
-            gen_force -= proj * fp_dir
-
-            # Convergence check
-            per_row_max = max(np.linalg.norm(gen_force[i])
-                              for i in range(natom + 3))
-            if per_row_max < fmax_tol:
-                break
-
-            # QuickMin-style velocity update (with momentum)
-            dV = gen_force * dt
-            if np.vdot(V, gen_force) > 0:
-                V = dV * (1.0 + np.vdot(dV, V) /
-                          max(np.vdot(dV, dV), 1e-10))
-            else:
-                V = dV
-
-            step_vec = V * dt
-            mag = np.sqrt(np.vdot(step_vec, step_vec))
-            if mag > 0.1:
-                step_vec *= 0.1 / mag
-
-            # Apply displacement
-            cellt = atoms.get_cell() + np.dot(atoms.get_cell(),
-                                               step_vec[-3:] / jacob)
-            atoms.set_cell(cellt, scale_atoms=True)
-            atoms.set_positions(atoms.get_positions() + step_vec[:-3])
-
-        if hasattr(atoms, 'invalidate_fp'):
-            atoms.invalidate_fp()
-        return atoms
-
-    # ── FP-drag chain: drag + dimer refinement ──────────────────────
-
-    def run_fp_drag_chain(self, drag_images=15, relax_steps=50,
-                          relax_fmax=0.03, max_segments=10):
-        """FP-drag chain: walk toward B, find saddles, discover intermediates.
-
-        Each segment:
-        1. FP-drag from current minimum toward B until energy maximum
-        2. Dimer refinement at the maximum → true saddle
-        3. Descend from saddle → next minimum (intermediate or B)
-        4. Repeat from the new minimum
-
-        This combines fast FP-drag exploration with rigorous dimer saddles.
-        No need to reach B in one drag — each segment finds one transition.
-
-        Parameters
-        ----------
-        drag_images : int — images per FP-drag segment.
-        relax_steps : int — perpendicular relaxation steps per image.
-        relax_fmax : float — perpendicular force tolerance.
-        max_segments : int — maximum A→...→B chain segments.
-
-        Returns
-        -------
-        nx.Graph
-        """
-        cfg = self.config
-        print(f"FP-drag chain: drag_images={drag_images}, "
-              f"max_segments={max_segments}")
-
-        # Optimize endpoints
-        A = self._optimize_and_register(self.reactant, is_base=True)
-        B = self._optimize_and_register(self.product, is_base=False)
-        types = self._get_types(A)
-        fp_B = B.get_fp()
-
-        d0 = fp_distance(A.get_fp(), fp_B, types)
-        print(f"  A: H=0.0000, B: H={self.G.nodes[B.id]['e']:.4f}, "
-              f"d_fp={d0:.5f}")
-
-        current = A
-        chain = [A]
-        prev_min_id = None
-        loop_count = 0
-
-        for seg in range(max_segments):
-            d_cur = fp_distance(current.get_fp(), fp_B, types)
-            ediff = abs(current.get_potential_energy()
-                        - B.get_potential_energy())
-            print(f"\n--- Segment {seg+1}/{max_segments} | "
-                  f"d_fp={d_cur:.5f}, ΔE={ediff:.5f} ---")
-
-            # Check if we've reached B
-            if d_cur < cfg.dist_threshold and ediff < cfg.ediff:
-                h_c = self.G.nodes[current.id]['e']
-                h_b = self.G.nodes[B.id]['e']
-                self.G.add_edge(current.id, B.id,
-                                weight=max(h_c, h_b), dist=d_cur)
-                print(f"  Reached B! M{current.id} ↔ M{B.id}")
-                break
-
-            # Escalate step size if stuck in a loop
-            esc = 1.0 + 0.5 * loop_count
-            eff_drag_images = drag_images
-
-            # Phase 1: FP-drag from current toward B
-            print(f"  Phase 1: FP-drag ({eff_drag_images} images, "
-                  f"escape={esc:.1f}x)")
-            drag_result = self._fp_drag_segment(
-                current, fp_B, types, eff_drag_images,
-                relax_steps, relax_fmax, step_multiplier=esc)
-
-            if drag_result is None:
-                print(f"  FP-drag failed, stopping")
-                break
-
-            saddle_approx = drag_result['saddle_structure']
-            h_saddle_approx = drag_result['saddle_energy']
-            h_current = self.G.nodes[current.id]['e']
-            print(f"  Approximate saddle: H={h_saddle_approx:.4f} "
-                  f"(barrier={h_saddle_approx - h_current:.4f})")
-
-            # Phase 2: Dimer refinement at the energy maximum
-            print(f"  Phase 2: Dimer refinement")
-            fp_mode = self._fp_gradient_mode(saddle_approx, fp_B)
-            saddle = cal_saddle(saddle_approx, fmax=cfg.saddle_fmax,
-                                steps=cfg.saddle_steps, mode=fp_mode)
-
-            sad_id, _ = self._update_saddle(saddle)
-            saddle.id = sad_id
-            h_sad = (saddle.get_volume() * cfg.press * GPa
-                     + saddle.get_potential_energy() - self.baseenergy)
-            curv = getattr(saddle, 'dimer_curvature', None)
-            curv_str = f", κ={curv:.3f}" if curv is not None else ""
-            self.G.add_node(sad_id, xname=f'S{sad_id}', e=h_sad,
-                            volume=saddle.get_volume())
-
-            # Edge: current → saddle
-            fp_s = saddle.get_fp()
-            d_cs = fp_distance(current.get_fp(), fp_s, types)
-            self.G.add_edge(current.id, sad_id,
-                            weight=max(h_current, h_sad), dist=d_cs)
-            print(f"  Saddle S{sad_id}: H={h_sad:.4f}{curv_str}")
-
-            # Phase 3: Descend from saddle → next minimum
-            # Escalate push strength if stuck in loop
-            push_esc = cfg.fp_push_scale * esc
-            print(f"  Phase 3: Descend (push={push_esc:.2f})")
-            escaped = self._saddle_escape(saddle, fp_B)
-            new_min = local_optimization(escaped, fmax=cfg.opt_fmax,
-                                         steps=cfg.opt_steps)
-            min_id, _ = self._update_minima(new_min)
-            new_min.id = min_id
-
-            h_min = (new_min.get_volume() * cfg.press * GPa
-                     + new_min.get_potential_energy() - self.baseenergy)
-            self.G.add_node(min_id, xname=f'M{min_id}', e=h_min,
-                            volume=new_min.get_volume())
-
-            # Edge: saddle → new minimum
-            fp_m = new_min.get_fp()
-            d_sm = fp_distance(fp_s, fp_m, types)
-            self.G.add_edge(sad_id, min_id,
-                            weight=max(h_sad, h_min), dist=d_sm)
-
-            d_new = fp_distance(fp_m, fp_B, types)
-            print(f"  New minimum M{min_id}: H={h_min:.4f}, "
-                  f"d_fp(→B)={d_new:.5f}")
-
-            # Loop detection: if we landed on the same minimum, escalate
-            if min_id == prev_min_id:
-                loop_count += 1
-                print(f"  LOOP detected (M{min_id} again, "
-                      f"count={loop_count})")
-            else:
-                loop_count = 0
-            prev_min_id = min_id
-
-            chain.extend([saddle, new_min])
-            current = new_min
-            self._save_state()
-
-        # Final report
-        print(f"\nChain: {' → '.join('M'+str(s.id) if hasattr(s,'id') and self.G.nodes.get(s.id,{}).get('xname','').startswith('M') else 'S'+str(s.id) for s in chain if hasattr(s,'id'))}")
-        try:
-            path, bn = minimax_path(self.G, A.id, B.id)
-            print(f"Best path: {' → '.join(str(n) for n in path)}")
-            print(f"Bottleneck: {bn:.4f} eV ({bn/len(A):.4f} eV/atom)")
-            for node in path:
-                nd = self.G.nodes[node]
-                ntype = 'MIN' if nd['xname'].startswith('M') else 'SAD'
-                print(f"  {ntype} {node}: E = {nd['e']:.4f} eV, "
-                      f"V = {nd['volume']:.1f}")
-        except nx.NetworkXNoPath:
-            print("No complete path found")
-
-        return self.G
-
-    def _fp_drag_segment(self, start, target_fp, types,
-                         n_images, relax_steps, relax_fmax,
-                         step_multiplier=1.0):
-        """One FP-drag segment: walk from start toward target, find E maximum.
-
-        Returns when energy starts decreasing (crossed the saddle ridge)
-        or after n_images steps.
-
-        Parameters
-        ----------
-        step_multiplier : float — escalation factor for step size (>1 if stuck).
-
-        Returns
-        -------
-        dict with saddle_structure, saddle_energy, saddle_idx, or None.
-        """
-        cfg = self.config
-        current = cp(start)
-        natom = len(current)
-
-        d_start = fp_distance(current.get_fp(), target_fp, types)
-        best_h = -float('inf')
-        best_struct = None
-        best_idx = 0
-        decline_count = 0
-
-        for i in range(n_images):
-            # FP gradient step
-            fp_mode = self._fp_gradient_mode(current, target_fp)
-            vol = current.get_volume()
-            jacob = (vol / natom) ** (1.0 / 3.0) * natom ** 0.5
-
-            scale = cfg.fp_step_scale / n_images * step_multiplier
-            scaled = fp_mode * scale
-            cellt = current.get_cell() + np.dot(current.get_cell(),
-                                                 scaled[-3:] / jacob)
-            current.set_cell(cellt, scale_atoms=True)
-            current.set_positions(current.get_positions() + scaled[:-3])
-            if hasattr(current, 'invalidate_fp'):
-                current.invalidate_fp()
-
-            # Perpendicular relaxation
-            if relax_steps > 0:
-                current = self._perpendicular_relax(
-                    current, target_fp, types, relax_steps, relax_fmax)
-
-            # Record energy
-            h = (current.get_volume() * cfg.press * GPa
-                 + current.get_potential_energy() - self.baseenergy)
-            d = fp_distance(current.get_fp(), target_fp, types)
-            progress = 1.0 - d / max(d_start, 1e-10)
-
-            print(f"    drag {i+1}/{n_images}: H={h:.4f}, "
-                  f"d_fp={d:.5f} ({progress:.0%})")
-
-            # Track energy maximum
-            if h > best_h:
-                best_h = h
-                best_struct = cp(current)
-                best_idx = i + 1
-                decline_count = 0
-            else:
-                decline_count += 1
-
-            # Stop if energy has been declining for 3+ images
-            # (we've crossed the saddle ridge)
-            if decline_count >= 3:
-                print(f"    Energy declining — saddle at image {best_idx}")
-                break
-
-        if best_struct is None:
-            return None
-
-        return {
-            'saddle_structure': best_struct,
-            'saddle_energy': best_h,
-            'saddle_idx': best_idx,
-        }
-
     # ── FP-guided chain-growing search ────────────────────────────────
 
     def run_fp_guided(self, n_probes=1):
@@ -1184,7 +750,7 @@ class Pallas:
 
             d_tips = fp_distance(tip_A.get_fp(), tip_B.get_fp(), types)
             ediff = abs(tip_A.get_potential_energy()
-                        - tip_B.get_potential_energy())
+                        - tip_B.get_potential_energy()) / len(tip_A)
 
             # Report current best path if exists
             bn_str = f", best barrier={best_bottleneck:.4f}" \
@@ -1395,7 +961,7 @@ class Pallas:
                         continue
                     d = fp_distance(ma.get_fp(), mb.get_fp(), types)
                     ediff = abs(ma.get_potential_energy()
-                                - mb.get_potential_energy())
+                                - mb.get_potential_energy()) / len(ma)
                     if d < cfg.dist_threshold and ediff < cfg.ediff:
                         h_a = self.G.nodes.get(ma.id, {}).get('e', 0)
                         h_b = self.G.nodes.get(mb.id, {}).get('e', 0)
@@ -1499,7 +1065,7 @@ class Pallas:
         # Check the two minima are distinct
         d = fp_distance(min_plus.get_fp(), min_minus.get_fp(), types)
         ediff = abs(min_plus.get_potential_energy()
-                    - min_minus.get_potential_energy())
+                    - min_minus.get_potential_energy()) / len(min_plus)
 
         if d < cfg.dist_threshold and ediff < cfg.ediff:
             result['reason'] = (f'same minimum on both sides '
@@ -1618,6 +1184,7 @@ class Pallas:
                            + m.get_potential_energy() - self.baseenergy)
                     self.G.add_node(mid, xname=f'M{mid}', e=h_m,
                                     volume=m.get_volume())
+                    self._save_to_traj(m, mid, 'minima', h_m)
                     if not self.G.has_edge(node_id, mid):
                         fp_s = saddle.get_fp()
                         fp_m = m.get_fp()
@@ -1669,7 +1236,7 @@ class Pallas:
                     continue
                 d = fp_distance(fp_a, fp_b, types)
                 ediff = abs(ma.get_potential_energy()
-                            - mb.get_potential_energy())
+                            - mb.get_potential_energy()) / len(ma)
                 if d < cfg.dist_threshold and ediff < cfg.ediff:
                     h_a = self.G.nodes.get(ma.id, {}).get('e', 0)
                     h_b = self.G.nodes.get(mb.id, {}).get('e', 0)
@@ -1720,12 +1287,14 @@ class Pallas:
 
         return probes
 
-    def _plan_refine_probes(self, path, A, B, known, types):
-        """Plan probes to attack the bottleneck on the current best path.
+    def _plan_hybrid_probes(self, path, A, B, known, types):
+        """Plan probes: half refine bottleneck, half explore from intermediates.
 
-        Finds the highest-energy saddle, identifies its flanking minima,
-        and launches probes from both sides of the bottleneck toward each
-        other with varying FP/random mixing.
+        Splits n_probes between:
+        - **Refine**: Attack the bottleneck saddle from both flanking minima.
+        - **Explore**: Probe from frontier intermediates (not on the
+          bottleneck) toward the other side, discovering new phases and
+          alternative pathways.
 
         Falls back to connect-style probes if no saddle found on path.
 
@@ -1744,10 +1313,9 @@ class Pallas:
                 worst_idx = i
 
         if worst_id is None:
-            # No saddle on path — fall back to connect probes
             return self._plan_connect_probes(A, B, known, types)
 
-        # Find flanking minima
+        # Find flanking minima for refine
         min_left = self._find_flanking_min(path, worst_idx, -1, known)
         min_right = self._find_flanking_min(path, worst_idx, +1, known)
 
@@ -1760,9 +1328,15 @@ class Pallas:
               f"flanked by M{min_left.id} ({h_left:.4f}) "
               f"↔ M{min_right.id} ({h_right:.4f})")
 
+        # Split probes: half refine, half explore
+        n_refine = max(cfg.n_probes // 2, 2)
+        n_explore = cfg.n_probes - n_refine
+
         probes = []
-        for i in range(cfg.n_probes):
-            alpha = max(1.0 - 0.2 * i, 0.1)
+
+        # --- Refine probes: attack bottleneck ---
+        for i in range(n_refine):
+            alpha = max(1.0 - 0.2 * i, 0.2)
             if i % 2 == 0:
                 probes.append((
                     min_left, min_right.get_fp(), alpha,
@@ -1772,6 +1346,56 @@ class Pallas:
                     min_right, min_left.get_fp(), alpha,
                     f'refine rev p{i}(α={alpha:.1f})'))
 
+        # --- Explore probes: from frontier intermediates ---
+        # Collect all known minima that are NOT the bottleneck flanks
+        # Rank by closeness to the opposite endpoint
+        flanks = {min_left.id, min_right.id}
+        explore_candidates = []
+        fp_A = A.get_fp()
+        fp_B = B.get_fp()
+
+        for mid, m in known.items():
+            if mid in flanks:
+                continue
+            fp_m = m.get_fp()
+            if fp_m is None:
+                continue
+            d_to_A = fp_distance(fp_m, fp_A, types)
+            d_to_B = fp_distance(fp_m, fp_B, types)
+            # Interesting intermediates: not too close to either endpoint
+            # Probe toward whichever endpoint is farther
+            if d_to_A > d_to_B:
+                explore_candidates.append(
+                    (mid, fp_A, d_to_A, f'd_A={d_to_A:.3f}'))
+            else:
+                explore_candidates.append(
+                    (mid, fp_B, d_to_B, f'd_B={d_to_B:.3f}'))
+
+        # Sort by distance to target (farthest first — most unexplored)
+        explore_candidates.sort(key=lambda x: -x[2])
+
+        for i in range(n_explore):
+            if explore_candidates:
+                idx = i % len(explore_candidates)
+                mid, tgt_fp, d, dstr = explore_candidates[idx]
+                alpha = max(0.8 - 0.2 * i, 0.2)
+                probes.append((
+                    known[mid], tgt_fp, alpha,
+                    f'explore M{mid} p{i}(α={alpha:.1f},{dstr})'))
+            else:
+                # No intermediates yet — extra refine probe
+                alpha = max(0.5 - 0.1 * i, 0.1)
+                if i % 2 == 0:
+                    probes.append((
+                        min_left, min_right.get_fp(), alpha,
+                        f'refine+ fwd p{i}(α={alpha:.1f})'))
+                else:
+                    probes.append((
+                        min_right, min_left.get_fp(), alpha,
+                        f'refine+ rev p{i}(α={alpha:.1f})'))
+
+        print(f"  Probes: {n_refine} refine + {n_explore} explore "
+              f"({len(explore_candidates)} intermediate candidates)")
         return probes
 
     def _classify_sides(self, A_id, B_id):
@@ -1870,7 +1494,7 @@ class Pallas:
                 d = fp_distance(
                     known[a_id].get_fp(), known[b_id].get_fp(), types)
                 ediff = abs(known[a_id].get_potential_energy()
-                            - known[b_id].get_potential_energy())
+                            - known[b_id].get_potential_energy()) / len(known[a_id])
                 if d < cfg.dist_threshold and ediff < cfg.ediff:
                     h_a = self.G.nodes[a_id]['e']
                     h_b = self.G.nodes[b_id]['e']
@@ -1901,6 +1525,7 @@ class Pallas:
                 ntype = 'MIN' if nd['xname'].startswith('M') else 'SAD'
                 print(f"  {ntype} {node}: H={nd['e']:.4f} eV, "
                       f"V={nd['volume']:.1f} A^3")
+            self.get_pathway_trajectory(best_path)
         else:
             print("\nNo complete path found")
         print(f"{'='*60}")
@@ -1909,15 +1534,15 @@ class Pallas:
 
     def _fp_guided_step(self, current, target_fp, types,
                         step_scale, alpha=1.0, side=""):
-        """One step: FP-drag to find saddle region → dimer refine → descend.
+        """One step of FP-guided chain growing (dimer from minimum).
 
         Parameters
         ----------
         current : PallasAtom — current chain tip (optimized minimum).
         target_fp : np.ndarray — target fingerprint to grow toward.
         types : np.ndarray — atom type array.
-        step_scale : float — perturbation magnitude (unused, kept for API).
-        alpha : float — FP/random mixing ratio for dimer mode initialization.
+        step_scale : float — perturbation magnitude.
+        alpha : float — FP/random mixing ratio (1.0 = pure FP, 0.0 = pure random).
         side : str — label for logging.
 
         Returns
@@ -1926,30 +1551,25 @@ class Pallas:
         """
         cfg = self.config
 
-        # Phase A: FP-drag to find approximate saddle (energy maximum)
-        drag_result = self._fp_drag_segment(
-            current, target_fp, types,
-            n_images=10, relax_steps=30, relax_fmax=0.05)
-
-        if drag_result is None:
-            print(f"  [{side}] FP-drag failed")
-            return current
-
-        saddle_approx = drag_result['saddle_structure']
-        h_approx = drag_result['saddle_energy']
-        h_cur = self.G.nodes[current.id]['e']
-
-        # Phase B: Dimer refinement at the energy maximum
-        fp_mode = self._fp_gradient_mode(saddle_approx, target_fp)
+        # Step 1: Build search mode from FP gradient + random component
+        fp_mode = self._fp_gradient_mode(current, target_fp)
         rand_mode = self._gen_random_velocity(current)
         mode = vunit(alpha * fp_mode + (1.0 - alpha) * rand_mode)
 
-        try:
-            saddle = cal_saddle(saddle_approx, fmax=cfg.saddle_fmax,
-                                steps=cfg.saddle_steps, mode=mode)
-        except Exception as e:
-            print(f"  [{side}] Dimer failed: {e}")
-            return current
+        # Step 2+3: Perturb along mode, run dimer with this mode
+        saddle = None
+        for attempt in range(cfg.max_retries + 1):
+            try:
+                scale = step_scale * (0.5 ** attempt)  # halve on retry
+                saddle = self._fp_guided_saddle(current, mode, scale)
+                break
+            except Exception as e:
+                if attempt < cfg.max_retries:
+                    print(f"  [{side}] Saddle attempt {attempt+1} failed "
+                          f"(scale={scale:.3f}): {e}, retrying...")
+                else:
+                    print(f"  [{side}] All saddle attempts failed: {e}")
+                    return current
 
         # Register saddle
         sad_id, _ = self._update_saddle(saddle)
@@ -1958,17 +1578,25 @@ class Pallas:
                  + saddle.get_potential_energy() - self.baseenergy)
         self.G.add_node(sad_id, xname=f'S{sad_id}', e=h_sad,
                         volume=saddle.get_volume())
+        self._save_to_traj(saddle, sad_id, 'saddle', h_sad)
 
+        # Edge: current → saddle (only if saddle is higher)
+        fp_c = current.get_fp()
+        fp_s = saddle.get_fp()
+        d_cs = fp_distance(fp_c, fp_s, types)
+        h_cur = self.G.nodes[current.id]['e']
+        if h_sad > h_cur:
+            self.G.add_edge(current.id, sad_id,
+                            weight=max(h_cur, h_sad), dist=d_cs)
+        else:
+            print(f"  [{side}] Skipping edge M{current.id}→S{sad_id}: "
+                  f"saddle ({h_sad:.4f}) ≤ minimum ({h_cur:.4f})")
+
+        # Log saddle info
         curv = getattr(saddle, 'dimer_curvature', None)
         curv_str = f", κ={curv:.3f}" if curv is not None else ""
 
-        # Edge: current → saddle
-        fp_s = saddle.get_fp()
-        d_cs = fp_distance(current.get_fp(), fp_s, types)
-        self.G.add_edge(current.id, sad_id,
-                        weight=max(h_cur, h_sad), dist=d_cs)
-
-        # Phase C: Escape saddle → next minimum
+        # Escape saddle along dimer mode toward target, then optimize
         escaped = self._saddle_escape(saddle, target_fp)
         new_min = local_optimization(escaped, fmax=cfg.opt_fmax,
                                      steps=cfg.opt_steps)
@@ -1979,14 +1607,20 @@ class Pallas:
                  + new_min.get_potential_energy() - self.baseenergy)
         self.G.add_node(min_id, xname=f'M{min_id}', e=h_min,
                         volume=new_min.get_volume())
+        self._save_to_traj(new_min, min_id, 'minima', h_min)
 
+        # Edge: saddle → new minimum (only if saddle is higher)
         fp_m = new_min.get_fp()
         d_sm = fp_distance(fp_s, fp_m, types)
-        self.G.add_edge(sad_id, min_id,
-                        weight=max(h_sad, h_min), dist=d_sm)
+        if h_sad > h_min:
+            self.G.add_edge(sad_id, min_id,
+                            weight=max(h_sad, h_min), dist=d_sm)
+        else:
+            print(f"  [{side}] Skipping edge S{sad_id}→M{min_id}: "
+                  f"saddle ({h_sad:.4f}) ≤ minimum ({h_min:.4f})")
 
         d_target = fp_distance(fp_m, target_fp, types)
-        print(f"  [{side}] drag→S{sad_id} ({h_sad:.3f}{curv_str}) "
+        print(f"  [{side}] S{sad_id} ({h_sad:.3f}{curv_str}) "
               f"→ M{min_id} ({h_min:.3f}) | d(→target)={d_target:.5f}")
         return new_min
 
@@ -2187,8 +1821,8 @@ class Pallas:
         for x in self.db.select(ctyp='minima'):
             fpx = np.array(x.data['fp'])
             d = fp_distance(fpm, fpx, types)
-            ediff = abs(em - x.data['energy'])
-            if d < 0.005 and ediff < 0.001:
+            ediff = abs(em - x.data['energy']) / len(minima)
+            if d < self.config.dist_threshold and ediff < self.config.ediff:
                 idm = x.id
                 isnew = False
                 break
@@ -2221,8 +1855,8 @@ class Pallas:
         for x in self.db.select(ctyp='saddle'):
             fpx = np.array(x.data['fp'])
             d = fp_distance(fps, fpx, types)
-            ediff = abs(es - x.data['energy'])
-            if d < 0.005 and ediff < 0.001:
+            ediff = abs(es - x.data['energy']) / len(saddle)
+            if d < self.config.dist_threshold and ediff < self.config.ediff:
                 ids = x.id
                 isnew = False
                 break
@@ -2247,6 +1881,51 @@ class Pallas:
             self.update_dij(ids, x.id, fp_distance(fps, fpx, types))
 
         return ids, isnew
+
+    # ── Trajectory ─────────────────────────────────────────────────
+
+    def _save_to_traj(self, atoms, node_id, ctyp, enthalpy):
+        """Append a structure to the exploration trajectory file."""
+        from ase.io import write as ase_write
+        atoms_copy = atoms.copy()
+        atoms_copy.info['node_id'] = node_id
+        atoms_copy.info['type'] = ctyp
+        atoms_copy.info['enthalpy_eV'] = float(enthalpy)
+        ase_write('pallas_traj.extxyz', atoms_copy, append=True)
+
+    def get_pathway_trajectory(self, path, filename='pathway.extxyz'):
+        """Extract ordered structures along a path and write trajectory.
+
+        Parameters
+        ----------
+        path : list of int — node IDs from minimax_path (e.g. [1, 5, 3, 8, 2]).
+        filename : str — output file.
+
+        Returns
+        -------
+        list of Atoms — ordered structures along the path.
+        """
+        from ase.io import write as ase_write
+        trajectory = []
+        for node_id in path:
+            nd = self.G.nodes[node_id]
+            is_min = nd['xname'].startswith('M')
+            ctyp = 'minima' if is_min else 'saddle'
+
+            # Retrieve from database
+            row = self.db.get(id=node_id)
+            atoms = row.toatoms()
+            atoms.info['node_id'] = node_id
+            atoms.info['xname'] = nd['xname']
+            atoms.info['enthalpy_eV'] = nd['e']
+            atoms.info['volume'] = nd['volume']
+            trajectory.append(atoms)
+
+        if trajectory:
+            ase_write(filename, trajectory)
+            print(f"Pathway trajectory written to {filename} "
+                  f"({len(trajectory)} frames)")
+        return trajectory
 
     # ── I/O ──────────────────────────────────────────────────────────
 
