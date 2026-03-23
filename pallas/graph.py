@@ -1,10 +1,11 @@
 # minimax_path.py
 from collections import deque
+import heapq
 import networkx as nx
 
 
 # ----------------------------------------------------------------------
-# 1.  A tiny, fast Union–Find with path-compression + union-by-rank
+# 1.  A tiny, fast Union-Find with path-compression + union-by-rank
 # ----------------------------------------------------------------------
 class UnionFind:
     __slots__ = ("p", "r")
@@ -33,7 +34,7 @@ class UnionFind:
 
 
 # ----------------------------------------------------------------------
-# 2.  Kruskal with **early stop**  ➜ O(E log E) worst-case but
+# 2.  Kruskal with early stop -> O(E log E) worst-case but
 #     usually stops as soon as start & goal are connected.
 #     Returns both the path and the bottleneck value.
 # ----------------------------------------------------------------------
@@ -76,8 +77,80 @@ def _restore_path(adj, s, t):
 
 
 # ----------------------------------------------------------------------
-# 3.  If you store a *node* attribute called 'energy' and the real
-#     “barrier” is the max energy along the path, wrap the helper below
+# 3.  Kinetic minimax: minimize the rate-limiting LOCAL barrier.
+#
+#     For a path M1-S1-M3-S2-M2, the local barrier of each step is
+#     H(saddle) - H(preceding minimum).  A deep intermediate trap makes
+#     the local barrier much larger than the overall forward barrier.
+#
+#     Uses modified Dijkstra on directed weights derived from node
+#     enthalpies:  min->saddle = H(S)-H(M),  saddle->min = 0.
+# ----------------------------------------------------------------------
+def minimax_path_kinetic(G, start, goal):
+    """Find path minimizing the rate-limiting (max local) barrier.
+
+    Parameters
+    ----------
+    G : nx.Graph -- nodes must have 'xname' (M* or S*) and 'e' (enthalpy).
+    start, goal : node IDs.
+
+    Returns
+    -------
+    path : list of node IDs
+    bottleneck : float -- the rate-limiting local barrier (eV).
+    """
+    dist = {v: float('inf') for v in G.nodes}
+    dist[start] = 0.0
+    prev = {start: None}
+    pq = [(0.0, 0, start)]  # (bottleneck, tiebreak, node)
+    counter = 1
+
+    while pq:
+        d, _, u = heapq.heappop(pq)
+        if d > dist[u]:
+            continue
+        if u == goal:
+            break
+
+        h_u = G.nodes[u]['e']
+        u_is_saddle = G.nodes[u]['xname'].startswith('S')
+
+        for v in G.neighbors(u):
+            h_v = G.nodes[v]['e']
+            v_is_saddle = G.nodes[v]['xname'].startswith('S')
+
+            # Directed weight based on node types
+            if not u_is_saddle and v_is_saddle:
+                # min -> saddle: cost = local barrier (climbing)
+                edge_w = max(0.0, h_v - h_u)
+            elif u_is_saddle and not v_is_saddle:
+                # saddle -> min: descending, free
+                edge_w = 0.0
+            else:
+                # min->min (direct connection) or saddle->saddle
+                edge_w = max(0.0, h_v - h_u)
+
+            new_d = max(d, edge_w)
+            if new_d < dist[v]:
+                dist[v] = new_d
+                prev[v] = u
+                heapq.heappush(pq, (new_d, counter, v))
+                counter += 1
+
+    if dist[goal] == float('inf'):
+        raise nx.NetworkXNoPath(f"{start} and {goal} are disconnected")
+
+    path = []
+    cur = goal
+    while cur is not None:
+        path.append(cur)
+        cur = prev[cur]
+    path.reverse()
+    return path, dist[goal]
+
+
+# ----------------------------------------------------------------------
+# 4.  Legacy helper
 # ----------------------------------------------------------------------
 def minimax_barrier(G, start, goal, weight="weight", energy="energy"):
     path, _ = minimax_path(G, start, goal, weight)

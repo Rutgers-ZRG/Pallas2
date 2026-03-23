@@ -667,7 +667,7 @@ class SolidStateDimer:
     # the dimer moving even through low-force regions.
 
     def search(self, fmax=0.01, max_force_calls=100000, quiet=True,
-               logfile='ssdimer.log'):
+               logfile='ssdimer.log', traj_frames=None):
         """Run dimer search using TSASE's QuickMin translation.
 
         Unlike FIRE, this keeps velocity-based momentum through
@@ -679,6 +679,8 @@ class SolidStateDimer:
         max_force_calls : int — maximum number of force evaluations.
         quiet : bool — suppress per-step output to stdout.
         logfile : str or None — write per-step log (step, energy, fmax, curvature).
+        traj_frames : list, optional — if provided, append atom snapshots
+            every 10 steps for smooth trajectory output.
         """
         if self.solid_state:
             V = np.zeros((self.num_atoms + 3, 3))
@@ -729,6 +731,10 @@ class SolidStateDimer:
             if not quiet and (step_count % 50 == 0 or step_count == 1):
                 print(f"  dimer step {step_count}: fmax={max_force:.6f}, "
                       f"κ={curv:.4f}, E={E:.4f}")
+
+            # Save trajectory frame
+            if traj_frames is not None and step_count % 10 == 0:
+                traj_frames.append(self.atoms.copy())
 
             if max_force < fmax and curv < 0:
                 self.converged_flag = True

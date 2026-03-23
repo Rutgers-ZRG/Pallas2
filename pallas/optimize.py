@@ -56,7 +56,8 @@ def _get_calculator():
 
 # ── Structure optimization ────────────────────────────────────────────
 
-def local_optimization(patoms, fmax=0.001, steps=2000, calc=None):
+def local_optimization(patoms, fmax=0.001, steps=2000, calc=None,
+                       traj_frames=None):
     """Optimize structure (positions + cell) with MatterSim.
 
     Parameters
@@ -65,6 +66,8 @@ def local_optimization(patoms, fmax=0.001, steps=2000, calc=None):
     fmax : float — force convergence threshold (eV/Å).
     steps : int — max optimizer steps.
     calc : Calculator, optional — override default MatterSim.
+    traj_frames : list, optional — if provided, append snapshots every
+        10 steps for smooth trajectory output.
 
     Returns
     -------
@@ -73,7 +76,14 @@ def local_optimization(patoms, fmax=0.001, steps=2000, calc=None):
     atoms = patoms
     atoms.calc = calc or _get_calculator()
     ecf = FrechetCellFilter(atoms)
+
+    def _save_frame():
+        if traj_frames is not None:
+            traj_frames.append(atoms.copy())
+
     opt = FIRE(ecf, maxstep=0.1, logfile='opt.log')
+    _save_frame()  # initial frame
+    opt.attach(_save_frame, interval=10)
     opt.run(fmax=fmax, steps=steps)
 
     actual_fmax = np.max(np.abs(ecf.get_forces()))
@@ -90,7 +100,7 @@ def local_optimization(patoms, fmax=0.001, steps=2000, calc=None):
 
 
 def cal_saddle(patoms, fmax=0.01, steps=2000, calc=None, mode=None,
-               optimizer='quickmin'):
+               optimizer='quickmin', traj_frames=None):
     """Find saddle point using solid-state dimer method.
 
     Parameters
@@ -106,6 +116,8 @@ def cal_saddle(patoms, fmax=0.01, steps=2000, calc=None, mode=None,
     optimizer : str — 'quickmin' (TSASE-style, default) or 'fire'.
         quickmin maintains momentum through low-force regions and requires
         negative curvature for convergence. fire may get stuck at minima.
+    traj_frames : list, optional — if provided, append snapshots every
+        10 steps for smooth trajectory output.
 
     Returns
     -------
@@ -134,11 +146,14 @@ def cal_saddle(patoms, fmax=0.01, steps=2000, calc=None, mode=None,
 
     if optimizer == 'quickmin':
         # TSASE-style: momentum-based, requires negative curvature
-        d.search(fmax=fmax, max_force_calls=steps * 3, quiet=False)
+        d.search(fmax=fmax, max_force_calls=steps * 3, quiet=False,
+                 traj_frames=traj_frames)
         atoms.converged = getattr(d, 'converged_flag', False)
     else:
         # ASE FIRE
         dyn = FIRE(d, maxstep=0.1, logfile='ssdimer.log')
+        if traj_frames is not None:
+            dyn.attach(lambda: traj_frames.append(atoms.copy()), interval=10)
         dyn.run(fmax=fmax, steps=steps)
         d.get_forces()  # capture curvature (ASE wrapper workaround)
         actual_fmax = np.max(np.abs(atoms.get_forces()))

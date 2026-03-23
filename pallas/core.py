@@ -28,7 +28,7 @@ import torch
 import torch_fplib
 from pallas.xcal import XCalculator, atoms_to_cell, fp_dist_with_assignment
 from pallas.optimize import local_optimization, cal_saddle, vunit, vrand, _get_calculator
-from pallas.graph import minimax_path
+from pallas.graph import minimax_path, minimax_path_kinetic
 
 
 # ── Configuration ─────────────────────────────────────────────────────
@@ -69,7 +69,7 @@ class PallasConfig:
     refine_probes: int = 5          # saddle searches per refinement round
 
     # Convergence
-    ediff: float = 0.005            # energy diff threshold per atom (eV/atom)
+    ediff: float = 0.005            # energy diff threshold, whole cell (eV)
     dist_threshold: float = 0.005   # FP distance threshold for same structure
 
     # Generational search parameters (used by run())
@@ -278,7 +278,7 @@ class Pallas:
             # Check current path status
             path_exists = False
             try:
-                cur_path, cur_barrier = minimax_path(self.G, A.id, B.id)
+                cur_path, cur_barrier = minimax_path_kinetic(self.G, A.id, B.id)
                 path_exists = True
             except nx.NetworkXNoPath:
                 pass
@@ -309,7 +309,7 @@ class Pallas:
 
             # Evaluate best path
             try:
-                path, barrier = minimax_path(self.G, A.id, B.id)
+                path, barrier = minimax_path_kinetic(self.G, A.id, B.id)
                 if barrier < best_barrier - cfg.min_barrier_change:
                     old = best_barrier
                     best_barrier = barrier
@@ -410,9 +410,9 @@ class Pallas:
             if connection_found:
                 print("Connection found! Searching for path...")
                 try:
-                    path, bottleneck = minimax_path(self.G, react_id, prod_id)
+                    path, bottleneck = minimax_path_kinetic(self.G, react_id, prod_id)
                     print(f"Path found: {path}")
-                    print(f"Bottleneck energy: {bottleneck:.4f}")
+                    print(f"Rate-limiting barrier: {bottleneck:.4f}")
                 except nx.NetworkXNoPath:
                     print("Connected but no path yet (graph not fully linked)")
 
@@ -471,9 +471,12 @@ class Pallas:
 
             h_sad = (saddle.get_volume() * self.config.press * GPa
                      + saddle.get_potential_energy() - self.baseenergy)
-            self.G.add_node(sad_id, xname=f'S{sad_id}', e=h_sad,
-                            volume=saddle.get_volume())
-            self._save_to_traj(saddle, sad_id, 'saddle', h_sad)
+            if sad_id not in self.G:
+                self.G.add_node(sad_id, xname=f'S{sad_id}', e=h_sad,
+                                volume=saddle.get_volume())
+                self._save_to_traj(saddle, sad_id, 'saddle', h_sad)
+            else:
+                h_sad = self.G.nodes[sad_id]['e']
 
             # Edge: anchor → saddle (only if saddle is higher)
             fp_a = anchor_opt.get_fp()
@@ -498,9 +501,12 @@ class Pallas:
 
             h_min = (new_min.get_volume() * self.config.press * GPa
                      + new_min.get_potential_energy() - self.baseenergy)
-            self.G.add_node(min_id, xname=f'M{min_id}', e=h_min,
-                            volume=new_min.get_volume())
-            self._save_to_traj(new_min, min_id, 'minima', h_min)
+            if min_id not in self.G:
+                self.G.add_node(min_id, xname=f'M{min_id}', e=h_min,
+                                volume=new_min.get_volume())
+                self._save_to_traj(new_min, min_id, 'minima', h_min)
+            else:
+                h_min = self.G.nodes[min_id]['e']  # use stored enthalpy
 
             # Edge: saddle → new minimum (only if saddle is higher)
             fp_m = new_min.get_fp()
@@ -538,7 +544,7 @@ class Pallas:
                 try:
                     d = fp_distance(fp_r, fp_p, types)
                     ediff = abs(mr.get_potential_energy()
-                                - mp.get_potential_energy()) / len(mr)
+                                - mp.get_potential_energy())
 
                     if d < self.config.dist_threshold and ediff < self.config.ediff:
                         # Close enough — add connecting edge
@@ -750,7 +756,7 @@ class Pallas:
 
             d_tips = fp_distance(tip_A.get_fp(), tip_B.get_fp(), types)
             ediff = abs(tip_A.get_potential_energy()
-                        - tip_B.get_potential_energy()) / len(tip_A)
+                        - tip_B.get_potential_energy())
 
             # Report current best path if exists
             bn_str = f", best barrier={best_bottleneck:.4f}" \
@@ -795,7 +801,7 @@ class Pallas:
 
             # Update best path
             try:
-                path, bottleneck = minimax_path(self.G, A.id, B.id)
+                path, bottleneck = minimax_path_kinetic(self.G, A.id, B.id)
                 if bottleneck < best_bottleneck:
                     best_bottleneck = bottleneck
                     best_path = path
@@ -860,7 +866,7 @@ class Pallas:
         types = self._get_types(self.init_minima[0])
 
         try:
-            best_path, best_bn = minimax_path(self.G, A_id, B_id)
+            best_path, best_bn = minimax_path_kinetic(self.G, A_id, B_id)
         except nx.NetworkXNoPath:
             print("No path exists to refine.")
             return None, float('inf')
@@ -961,7 +967,7 @@ class Pallas:
                         continue
                     d = fp_distance(ma.get_fp(), mb.get_fp(), types)
                     ediff = abs(ma.get_potential_energy()
-                                - mb.get_potential_energy()) / len(ma)
+                                - mb.get_potential_energy())
                     if d < cfg.dist_threshold and ediff < cfg.ediff:
                         h_a = self.G.nodes.get(ma.id, {}).get('e', 0)
                         h_b = self.G.nodes.get(mb.id, {}).get('e', 0)
@@ -970,7 +976,7 @@ class Pallas:
 
             # Re-evaluate best path
             try:
-                path, bn = minimax_path(self.G, A_id, B_id)
+                path, bn = minimax_path_kinetic(self.G, A_id, B_id)
                 if bn < best_bn:
                     print(f"    IMPROVED: {best_bn:.4f} -> {bn:.4f} eV")
                     print(f"    New path: {' -> '.join(str(n) for n in path)}")
@@ -1065,7 +1071,7 @@ class Pallas:
         # Check the two minima are distinct
         d = fp_distance(min_plus.get_fp(), min_minus.get_fp(), types)
         ediff = abs(min_plus.get_potential_energy()
-                    - min_minus.get_potential_energy()) / len(min_plus)
+                    - min_minus.get_potential_energy())
 
         if d < cfg.dist_threshold and ediff < cfg.ediff:
             result['reason'] = (f'same minimum on both sides '
@@ -1182,9 +1188,12 @@ class Pallas:
                     m.id = mid
                     h_m = (m.get_volume() * cfg.press * GPa
                            + m.get_potential_energy() - self.baseenergy)
-                    self.G.add_node(mid, xname=f'M{mid}', e=h_m,
-                                    volume=m.get_volume())
-                    self._save_to_traj(m, mid, 'minima', h_m)
+                    if mid not in self.G:
+                        self.G.add_node(mid, xname=f'M{mid}', e=h_m,
+                                        volume=m.get_volume())
+                        self._save_to_traj(m, mid, 'minima', h_m)
+                    else:
+                        h_m = self.G.nodes[mid]['e']  # use stored enthalpy
                     if not self.G.has_edge(node_id, mid):
                         fp_s = saddle.get_fp()
                         fp_m = m.get_fp()
@@ -1236,7 +1245,7 @@ class Pallas:
                     continue
                 d = fp_distance(fp_a, fp_b, types)
                 ediff = abs(ma.get_potential_energy()
-                            - mb.get_potential_energy()) / len(ma)
+                            - mb.get_potential_energy())
                 if d < cfg.dist_threshold and ediff < cfg.ediff:
                     h_a = self.G.nodes.get(ma.id, {}).get('e', 0)
                     h_b = self.G.nodes.get(mb.id, {}).get('e', 0)
@@ -1494,7 +1503,7 @@ class Pallas:
                 d = fp_distance(
                     known[a_id].get_fp(), known[b_id].get_fp(), types)
                 ediff = abs(known[a_id].get_potential_energy()
-                            - known[b_id].get_potential_energy()) / len(known[a_id])
+                            - known[b_id].get_potential_energy())
                 if d < cfg.dist_threshold and ediff < cfg.ediff:
                     h_a = self.G.nodes[a_id]['e']
                     h_b = self.G.nodes[b_id]['e']
@@ -1516,15 +1525,12 @@ class Pallas:
 
         if best_path:
             print(f"\nBest path: {' -> '.join(str(n) for n in best_path)}")
-            print(f"Barrier: {best_barrier:.4f} eV")
-            nat = len(A)
-            if nat > 1:
-                print(f"         {best_barrier/nat:.4f} eV/atom")
             for node in best_path:
                 nd = self.G.nodes[node]
                 ntype = 'MIN' if nd['xname'].startswith('M') else 'SAD'
                 print(f"  {ntype} {node}: H={nd['e']:.4f} eV, "
                       f"V={nd['volume']:.1f} A^3")
+            self.analyze_pathway(best_path)
             self.get_pathway_trajectory(best_path)
         else:
             print("\nNo complete path found")
@@ -1557,11 +1563,14 @@ class Pallas:
         mode = vunit(alpha * fp_mode + (1.0 - alpha) * rand_mode)
 
         # Step 2+3: Perturb along mode, run dimer with this mode
+        traj_frames = []
+        traj_frames.append(current.copy())  # starting minimum
         saddle = None
         for attempt in range(cfg.max_retries + 1):
             try:
                 scale = step_scale * (0.5 ** attempt)  # halve on retry
-                saddle = self._fp_guided_saddle(current, mode, scale)
+                saddle = self._fp_guided_saddle(
+                    current, mode, scale, traj_frames=traj_frames)
                 break
             except Exception as e:
                 if attempt < cfg.max_retries:
@@ -1576,9 +1585,12 @@ class Pallas:
         saddle.id = sad_id
         h_sad = (saddle.get_volume() * cfg.press * GPa
                  + saddle.get_potential_energy() - self.baseenergy)
-        self.G.add_node(sad_id, xname=f'S{sad_id}', e=h_sad,
-                        volume=saddle.get_volume())
-        self._save_to_traj(saddle, sad_id, 'saddle', h_sad)
+        if sad_id not in self.G:
+            self.G.add_node(sad_id, xname=f'S{sad_id}', e=h_sad,
+                            volume=saddle.get_volume())
+            self._save_to_traj(saddle, sad_id, 'saddle', h_sad)
+        else:
+            h_sad = self.G.nodes[sad_id]['e']  # use stored enthalpy
 
         # Edge: current → saddle (only if saddle is higher)
         fp_c = current.get_fp()
@@ -1598,26 +1610,42 @@ class Pallas:
 
         # Escape saddle along dimer mode toward target, then optimize
         escaped = self._saddle_escape(saddle, target_fp)
+        traj_frames.append(escaped.copy())  # escaped structure
         new_min = local_optimization(escaped, fmax=cfg.opt_fmax,
-                                     steps=cfg.opt_steps)
+                                     steps=cfg.opt_steps,
+                                     traj_frames=traj_frames)
         min_id, _ = self._update_minima(new_min)
         new_min.id = min_id
 
         h_min = (new_min.get_volume() * cfg.press * GPa
                  + new_min.get_potential_energy() - self.baseenergy)
-        self.G.add_node(min_id, xname=f'M{min_id}', e=h_min,
-                        volume=new_min.get_volume())
-        self._save_to_traj(new_min, min_id, 'minima', h_min)
+        if min_id not in self.G:
+            self.G.add_node(min_id, xname=f'M{min_id}', e=h_min,
+                            volume=new_min.get_volume())
+            self._save_to_traj(new_min, min_id, 'minima', h_min)
+        else:
+            h_min = self.G.nodes[min_id]['e']  # use stored enthalpy
 
         # Edge: saddle → new minimum (only if saddle is higher)
         fp_m = new_min.get_fp()
         d_sm = fp_distance(fp_s, fp_m, types)
+        traj_file = f'traj_M{current.id}_S{sad_id}_M{min_id}.extxyz'
         if h_sad > h_min:
             self.G.add_edge(sad_id, min_id,
-                            weight=max(h_sad, h_min), dist=d_sm)
+                            weight=max(h_sad, h_min), dist=d_sm,
+                            traj_file=traj_file)
         else:
             print(f"  [{side}] Skipping edge S{sad_id}→M{min_id}: "
                   f"saddle ({h_sad:.4f}) ≤ minimum ({h_min:.4f})")
+
+        # Also store traj_file on current→saddle edge
+        if self.G.has_edge(current.id, sad_id):
+            self.G.edges[current.id, sad_id]['traj_file'] = traj_file
+
+        # Save probe trajectory to disk
+        if traj_frames:
+            from ase.io import write as ase_write
+            ase_write(traj_file, traj_frames)
 
         d_target = fp_distance(fp_m, target_fp, types)
         print(f"  [{side}] S{sad_id} ({h_sad:.3f}{curv_str}) "
@@ -1675,7 +1703,8 @@ class Pallas:
 
         return vunit(mode)
 
-    def _fp_guided_saddle(self, structure, mode, step_scale, n_mode_tries=3):
+    def _fp_guided_saddle(self, structure, mode, step_scale,
+                          n_mode_tries=3, traj_frames=None):
         """Perturb along FP gradient, then find saddle with aligned dimer.
 
         Tries multiple initial mode directions from the same perturbed
@@ -1688,6 +1717,7 @@ class Pallas:
         mode : np.ndarray — FP gradient mode (natom+3, 3).
         step_scale : float — perturbation magnitude.
         n_mode_tries : int — number of different initial modes to try.
+        traj_frames : list, optional — collect dimer trajectory frames.
 
         Returns
         -------
@@ -1711,6 +1741,7 @@ class Pallas:
         # Try multiple initial modes from this perturbed structure
         best_saddle = None
         best_curvature = float('inf')
+        best_frames = None
 
         for attempt in range(n_mode_tries):
             if attempt == 0:
@@ -1721,18 +1752,25 @@ class Pallas:
                 mix = max(0.7 - 0.3 * attempt, 0.1)
                 trial_mode = vunit(mix * mode + (1.0 - mix) * rand)
 
+            attempt_frames = [] if traj_frames is not None else None
             saddle = cal_saddle(cp(perturbed), fmax=cfg.saddle_fmax,
-                                steps=cfg.saddle_steps, mode=trial_mode)
+                                steps=cfg.saddle_steps, mode=trial_mode,
+                                traj_frames=attempt_frames)
             curv = getattr(saddle, 'dimer_curvature', None)
 
             if curv is not None and curv < best_curvature:
                 best_curvature = curv
                 best_saddle = saddle
+                best_frames = attempt_frames
 
             # Stop early if we found a true saddle
             if curv is not None and curv < 0 and saddle.converged:
+                if traj_frames is not None and attempt_frames:
+                    traj_frames.extend(attempt_frames)
                 return saddle
 
+        if traj_frames is not None and best_frames:
+            traj_frames.extend(best_frames)
         return best_saddle if best_saddle is not None else saddle
 
     def _saddle_escape(self, saddle, target_fp):
@@ -1821,7 +1859,7 @@ class Pallas:
         for x in self.db.select(ctyp='minima'):
             fpx = np.array(x.data['fp'])
             d = fp_distance(fpm, fpx, types)
-            ediff = abs(em - x.data['energy']) / len(minima)
+            ediff = abs(em - x.data['energy'])
             if d < self.config.dist_threshold and ediff < self.config.ediff:
                 idm = x.id
                 isnew = False
@@ -1855,7 +1893,7 @@ class Pallas:
         for x in self.db.select(ctyp='saddle'):
             fpx = np.array(x.data['fp'])
             d = fp_distance(fps, fpx, types)
-            ediff = abs(es - x.data['energy']) / len(saddle)
+            ediff = abs(es - x.data['energy'])
             if d < self.config.dist_threshold and ediff < self.config.ediff:
                 ids = x.id
                 isnew = False
@@ -1894,7 +1932,12 @@ class Pallas:
         ase_write('pallas_traj.extxyz', atoms_copy, append=True)
 
     def get_pathway_trajectory(self, path, filename='pathway.extxyz'):
-        """Extract ordered structures along a path and write trajectory.
+        """Extract smooth trajectory along a path by stitching per-edge files.
+
+        For each consecutive pair of nodes on the path, looks for a saved
+        per-probe trajectory file (traj_M*_S*_M*.extxyz) on the edge.
+        If found, includes all intermediate frames for a smooth movie.
+        Falls back to key-frame-only output if no trajectory files exist.
 
         Parameters
         ----------
@@ -1905,27 +1948,56 @@ class Pallas:
         -------
         list of Atoms — ordered structures along the path.
         """
-        from ase.io import write as ase_write
-        trajectory = []
-        for node_id in path:
-            nd = self.G.nodes[node_id]
-            is_min = nd['xname'].startswith('M')
-            ctyp = 'minima' if is_min else 'saddle'
+        from ase.io import write as ase_write, read as ase_read
 
-            # Retrieve from database
-            row = self.db.get(id=node_id)
-            atoms = row.toatoms()
-            atoms.info['node_id'] = node_id
-            atoms.info['xname'] = nd['xname']
-            atoms.info['enthalpy_eV'] = nd['e']
-            atoms.info['volume'] = nd['volume']
-            trajectory.append(atoms)
+        smooth_traj = []
+        used_files = set()
 
-        if trajectory:
-            ase_write(filename, trajectory)
+        # Try to build smooth trajectory from per-edge files
+        for i in range(len(path) - 1):
+            n1, n2 = path[i], path[i + 1]
+            edge_data = self.G.edges.get((n1, n2), {})
+            traj_file = edge_data.get('traj_file', None)
+
+            if traj_file and os.path.exists(traj_file) \
+                    and traj_file not in used_files:
+                frames = ase_read(traj_file, index=':')
+                # Determine direction: file is always saved as
+                # M(source)→S→M(new), so if edge is reversed, flip frames
+                if i == 0:
+                    smooth_traj.extend(frames)
+                else:
+                    # Skip first frame to avoid duplicating the junction
+                    smooth_traj.extend(frames[1:])
+                used_files.add(traj_file)
+            else:
+                # Fallback: add key frame from database
+                node_id = path[i]
+                if not smooth_traj:  # only add if we haven't started
+                    row = self.db.get(id=node_id)
+                    atoms = row.toatoms()
+                    nd = self.G.nodes[node_id]
+                    atoms.info['xname'] = nd['xname']
+                    atoms.info['enthalpy_eV'] = nd['e']
+                    smooth_traj.append(atoms)
+
+        # Always add final node
+        if path:
+            last_id = path[-1]
+            if not used_files:
+                row = self.db.get(id=last_id)
+                atoms = row.toatoms()
+                nd = self.G.nodes[last_id]
+                atoms.info['xname'] = nd['xname']
+                atoms.info['enthalpy_eV'] = nd['e']
+                smooth_traj.append(atoms)
+
+        if smooth_traj:
+            ase_write(filename, smooth_traj)
             print(f"Pathway trajectory written to {filename} "
-                  f"({len(trajectory)} frames)")
-        return trajectory
+                  f"({len(smooth_traj)} frames, "
+                  f"{len(used_files)} edge trajectories stitched)")
+        return smooth_traj
 
     # ── I/O ──────────────────────────────────────────────────────────
 
@@ -1937,16 +2009,137 @@ class Pallas:
         joblib.dump(self.dij, 'dij.pkl')
 
     def find_best_path(self):
-        """Find minimax-bottleneck path between reactant and product.
+        """Find kinetically optimal path between reactant and product.
+
+        Uses directed minimax to minimize the rate-limiting local barrier
+        (max of H_saddle − H_preceding_min over all steps).
 
         Returns
         -------
         path : list of node IDs
-        bottleneck : float — max edge weight along the path.
+        bottleneck : float — rate-limiting local barrier (eV).
         """
         react_id = self.init_minima[0].id
         prod_id = self.init_minima[1].id
-        return minimax_path(self.G, react_id, prod_id)
+        return minimax_path_kinetic(self.G, react_id, prod_id)
+
+    def analyze_pathway(self, path):
+        """Decompose a pathway into per-step barriers and identify traps.
+
+        For path M1→S1→M3→S2→M2, reports:
+        - Per-step forward barriers (each saddle minus preceding minimum)
+        - Overall forward barrier from start (max saddle - H_start)
+        - Rate-limiting step (max local barrier)
+        - Deep intermediates (minima significantly below adjacent saddles)
+
+        Parameters
+        ----------
+        path : list of node IDs — alternating minima and saddles.
+
+        Returns
+        -------
+        dict with keys: 'steps', 'forward_barrier', 'rate_limiting_barrier',
+                        'rate_limiting_step', 'start_H', 'end_H'.
+        """
+        nodes = self.G.nodes
+        h_start = nodes[path[0]]['e']
+        h_end = nodes[path[-1]]['e']
+
+        # Walk path and extract steps (handles min-saddle-min and min-min)
+        steps = []
+        i = 0
+        while i < len(path) - 1:
+            cur = path[i]
+            cur_is_min = nodes[cur]['xname'].startswith('M')
+            nxt = path[i + 1]
+            nxt_is_sad = nodes[nxt]['xname'].startswith('S')
+
+            if cur_is_min and nxt_is_sad and i + 2 < len(path):
+                # Normal step: M → S → M
+                sad_id = nxt
+                min_after = path[i + 2]
+                h_mb = nodes[cur]['e']
+                h_sad = nodes[sad_id]['e']
+                h_ma = nodes[min_after]['e']
+                steps.append({
+                    'min_before': cur, 'saddle': sad_id,
+                    'min_after': min_after,
+                    'H_min_before': h_mb, 'H_saddle': h_sad,
+                    'H_min_after': h_ma,
+                    'forward_barrier': h_sad - h_mb,
+                    'reverse_barrier': h_sad - h_ma,
+                })
+                i += 2
+            elif cur_is_min and not nxt_is_sad:
+                # Direct min→min connection (same structure)
+                steps.append({
+                    'min_before': cur, 'saddle': None,
+                    'min_after': nxt,
+                    'H_min_before': nodes[cur]['e'], 'H_saddle': None,
+                    'H_min_after': nodes[nxt]['e'],
+                    'forward_barrier': 0.0, 'reverse_barrier': 0.0,
+                })
+                i += 1
+            else:
+                i += 1
+
+        # Overall forward barrier = max saddle - start
+        saddle_Hs = [s['H_saddle'] for s in steps if s['H_saddle'] is not None]
+        max_sad_H = max(saddle_Hs) if saddle_Hs else h_start
+        forward_barrier = max_sad_H - h_start
+
+        # Rate-limiting step = max local forward barrier
+        rate_limiting = max(steps, key=lambda s: s['forward_barrier']) \
+            if steps else None
+        rl_barrier = rate_limiting['forward_barrier'] if rate_limiting else 0.0
+
+        # Print analysis
+        nat = len(self.init_minima[0]) if self.init_minima else 1
+        print(f"\n{'─'*60}")
+        print(f"Pathway analysis ({len(steps)} steps)")
+        print(f"{'─'*60}")
+        print(f"Start M{path[0]}: H = {h_start:.4f} eV")
+
+        for k, s in enumerate(steps):
+            trap_flag = ""
+            if s['forward_barrier'] > forward_barrier + 0.001:
+                trap_flag = "  ** DEEP TRAP **"
+            if s['saddle'] is not None:
+                print(f"  Step {k+1}: M{s['min_before']} -> "
+                      f"S{s['saddle']} -> M{s['min_after']}")
+                print(f"    Forward barrier: {s['forward_barrier']:.4f} eV "
+                      f"({s['forward_barrier']/nat:.4f} eV/atom){trap_flag}")
+                print(f"    Reverse barrier: {s['reverse_barrier']:.4f} eV")
+            else:
+                print(f"  Step {k+1}: M{s['min_before']} == "
+                      f"M{s['min_after']} (direct connection)")
+
+        print(f"End M{path[-1]}: H = {h_end:.4f} eV")
+        print(f"\nOverall forward barrier (max saddle - start): "
+              f"{forward_barrier:.4f} eV ({forward_barrier/nat:.4f} eV/atom)")
+        print(f"Rate-limiting step: ", end="")
+        if rate_limiting and rate_limiting['saddle'] is not None:
+            print(f"M{rate_limiting['min_before']} -> "
+                  f"S{rate_limiting['saddle']} -> "
+                  f"M{rate_limiting['min_after']}, "
+                  f"barrier = {rl_barrier:.4f} eV "
+                  f"({rl_barrier/nat:.4f} eV/atom)")
+        else:
+            print("(no barriers)")
+
+        if rl_barrier > forward_barrier + 0.01:
+            print(f"WARNING: Rate-limiting barrier ({rl_barrier:.4f}) > "
+                  f"forward barrier ({forward_barrier:.4f}) — deep "
+                  f"intermediate traps on pathway!")
+        print(f"{'─'*60}")
+
+        return {
+            'steps': steps,
+            'forward_barrier': forward_barrier,
+            'rate_limiting_barrier': rl_barrier,
+            'rate_limiting_step': rate_limiting,
+            'start_H': h_start, 'end_H': h_end,
+        }
 
 
 # ── Standalone analysis utilities ─────────────────────────────────────
@@ -1974,13 +2167,13 @@ def listpath(graph_file='graph.pkl', db_file='pallas.db',
         end = max(minima_ids)
 
     try:
-        path, bottleneck = minimax_path(G, start, end)
+        path, bottleneck = minimax_path_kinetic(G, start, end)
     except nx.NetworkXNoPath:
         print(f"No path between {start} and {end}")
         return
 
-    print(f"Best path (minimax): {path}")
-    print(f"Bottleneck energy: {bottleneck:.4f}")
+    print(f"Best path (kinetic minimax): {path}")
+    print(f"Rate-limiting barrier: {bottleneck:.4f}")
 
     # Create output directory
     os.makedirs("path_output", exist_ok=True)
