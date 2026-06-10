@@ -34,3 +34,21 @@ def test_raises_on_fused_atoms():
     a.calc = GeometryGuard(EMT())
     with pytest.raises(GeometryError):
         a.get_potential_energy()
+
+
+def test_raises_on_runaway_forces():
+    from ase.calculators.calculator import Calculator, all_changes
+
+    class HugeForce(Calculator):
+        implemented_properties = ['energy', 'forces', 'stress']
+
+        def calculate(self, atoms=None, properties=None, system_changes=all_changes):
+            super().calculate(atoms, properties, system_changes)
+            f = np.zeros((len(self.atoms), 3))
+            f[0, 0] = 120.0
+            self.results = {'energy': 5.0, 'forces': f, 'stress': np.zeros(6)}
+
+    a = bulk('Cu', 'fcc', a=3.6, cubic=True)
+    a.calc = GeometryGuard(HugeForce())
+    with pytest.raises(GeometryError):
+        a.get_forces()

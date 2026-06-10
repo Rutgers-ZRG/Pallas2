@@ -70,11 +70,13 @@ class GeometryGuard(Calculator):
 
     implemented_properties = ['energy', 'forces', 'stress']
 
-    def __init__(self, calc, min_height=0.9, min_dist=0.5, **kwargs):
+    def __init__(self, calc, min_height=0.9, min_dist=0.5, max_force=50.0,
+                 **kwargs):
         super().__init__(**kwargs)
         self.inner = calc
         self.min_height = float(min_height)
         self.min_dist = float(min_dist)
+        self.max_force = float(max_force)
 
     def _check(self, atoms):
         cell = atoms.get_cell()[:]
@@ -105,6 +107,10 @@ class GeometryGuard(Calculator):
         e = self.inner.get_potential_energy(self.atoms)
         f = self.inner.get_forces(self.atoms)
         st = self.inner.get_stress(self.atoms)
+        fmax = float(np.abs(f).max()) if len(f) else 0.0
+        if fmax > self.max_force:
+            raise GeometryError(
+                f'fmax {fmax:.1f} eV/A > {self.max_force} (runaway region)')
         self.results = {'energy': e, 'forces': f, 'stress': st}
 
 

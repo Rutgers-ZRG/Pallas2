@@ -69,6 +69,8 @@ def cmd_run(args):
         patience=args.patience,
         opt_fmax=args.fmax,
         saddle_fmax=args.saddle_fmax,
+        opt_steps=args.opt_steps,
+        saddle_steps=args.saddle_steps,
         natx=args.natx,
         n_workers=args.n_workers,
         probe_alloc=args.probe_alloc,
@@ -156,6 +158,8 @@ def main(argv=None):
     pr.add_argument('--patience', type=int, default=5)
     pr.add_argument('--fmax', type=float, default=0.005)
     pr.add_argument('--saddle-fmax', type=float, default=0.05)
+    pr.add_argument('--opt-steps', type=int, default=1000)
+    pr.add_argument('--saddle-steps', type=int, default=500)
     pr.add_argument('--natx', type=int, default=100)
     pr.add_argument('--seed', type=int, default=42)
     pr.add_argument('--n-workers', type=int, default=1,
