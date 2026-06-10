@@ -42,6 +42,9 @@ class PallasConfig:
 
     # Generational search parameters (used by run())
     n_probes: int = 5               # probes per generation
+    n_workers: int = 1              # parallel probe workers (1 = serial;
+                                    # >1 needs a picklable CPU calculator)
+    probe_alloc: str = 'adaptive'   # frontier-tip allocation: 'adaptive' | 'round_robin'
     max_gen: int = 50               # max generations
     patience: int = 5               # stop after N gens without barrier improvement
     min_barrier_change: float = 0.001  # minimum improvement to reset patience (eV)

@@ -13,8 +13,32 @@ from pallas.analysis import AnalysisMixin
 from pallas.config import PallasConfig
 from pallas.graph import k_best_paths, minimax_path_kinetic
 from pallas.optimize import local_optimization
-from pallas.probes import ProbeMixin
+from pallas.probes import ProbeMixin, probe_compute
 from pallas.structure import PallasAtom, enthalpy, fp_distance, spacegroup_label
+
+
+def allocate_tips(frontier, n_probes, stats, mode='adaptive', T=0.02, rng=None):
+    """Choose frontier-tip indices for ``n_probes`` probes.
+
+    frontier : list of (tip_id, target_fp, d_fp) ranked entries.
+    stats : dict tip_id -> [successes, attempts] from previous generations.
+
+    'round_robin' cycles tips in rank order. 'adaptive' samples with
+    weight exp(-d/T) * (1+s)/(1+a): closer tips and historically
+    productive tips get more probes; unvisited tips keep weight 1 on the
+    success factor (exploration floor).
+    """
+    if not frontier:
+        return []
+    if mode == 'round_robin' or len(frontier) == 1:
+        return [i % len(frontier) for i in range(n_probes)]
+    if rng is None:
+        rng = np.random.default_rng()
+    d = np.array([f[2] for f in frontier], dtype=float)
+    sa = np.array([stats.get(f[0], [0, 0]) for f in frontier], dtype=float)
+    w = np.exp(-d / T) * (1.0 + sa[:, 0]) / (1.0 + sa[:, 1])
+    w /= w.sum()
+    return list(rng.choice(len(frontier), size=n_probes, p=w))
 
 
 class Pallas(ProbeMixin, AnalysisMixin):
@@ -88,6 +112,7 @@ class Pallas(ProbeMixin, AnalysisMixin):
             raise ValueError("Need at least 2 structures (reactant and product)")
 
         self.db = ase.db.connect('pallas.db')
+        self._probe_stats = {}
 
         self.init_minima = []
         for xf in flist:
@@ -100,8 +125,63 @@ class Pallas(ProbeMixin, AnalysisMixin):
 
         self.reactant = self.init_minima[0]
         self.product = self.init_minima[1]
+        self._validate_endpoints(self.reactant, self.product)
+
+    @staticmethod
+    def _validate_endpoints(a, b):
+        """Fail loudly on incompatible endpoint structures."""
+        from collections import Counter
+        ca = Counter(a.get_chemical_symbols())
+        cb = Counter(b.get_chemical_symbols())
+        if len(a) != len(b):
+            raise ValueError(
+                f"Endpoint atom count mismatch: {len(a)} vs {len(b)} "
+                f"({dict(ca)} vs {dict(cb)}). Use atoms.repeat() to build "
+                f"commensurate supercells with equal formula units.")
+        if ca != cb:
+            raise ValueError(
+                f"Endpoint composition mismatch: {dict(ca)} vs {dict(cb)}. "
+                f"Both endpoints must contain the same atoms.")
 
     # ── Unified generational search ──────────────────────────────────
+
+    def _record_probe_outcome(self, source, new_min, target_fp, types):
+        """Update per-tip success stats for adaptive allocation."""
+        st = self._probe_stats.setdefault(source.id, [0, 0])
+        st[1] += 1
+        if new_min is not source:
+            try:
+                d_new = fp_distance(new_min.get_fp(), target_fp, types)
+                d_src = fp_distance(source.get_fp(), target_fp, types)
+                if d_new < d_src:
+                    st[0] += 1
+            except Exception:
+                pass
+
+    def _resolve_workers(self, n_probes):
+        """Decide parallel worker count and the calculator to ship.
+
+        Serial (1, None) unless config.n_workers > 1 AND the active
+        calculator is picklable (EMT-like) or unset (lazy MatterSim,
+        re-initialized per worker). Non-picklable calculators (TorchScript,
+        CUDA-bound) force serial — correctness over speed.
+        """
+        n = max(1, int(getattr(self.config, 'n_workers', 1)))
+        n = min(n, n_probes)
+        if n == 1:
+            return 1, None
+        from pallas import optimize as _opt
+        calc = _opt._calc
+        if calc is None:
+            return n, None
+        import pickle
+        try:
+            pickle.dumps(calc)
+            return n, calc
+        except Exception:
+            print(f"  n_workers={n} requested but calculator is not "
+                  f"picklable -> running serial")
+            return 1, None
 
     def run(self):
         """Unified pathway search: connect, then hybrid refine+explore.
@@ -164,14 +244,34 @@ class Pallas(ProbeMixin, AnalysisMixin):
             bn_str = f", barrier={best_barrier:.4f}" if best_path else ""
             print(f"\n=== Gen {gen+1}/{cfg.max_gen} [{mode}]{bn_str} ===")
 
-            # Execute probes
-            for source, target_fp, alpha, label in probes:
-                new_min = self._fp_guided_step(
-                    source, target_fp, types,
-                    step_scale=cfg.fp_step_scale,
-                    alpha=alpha, side=label)
-                if new_min is not source and new_min.id not in known:
-                    known[new_min.id] = new_min
+            # Execute probes (parallel compute + serial registration)
+            n_w, worker_calc = self._resolve_workers(len(probes))
+            if n_w > 1:
+                from joblib import Parallel, delayed
+                seed_base = int(np.random.randint(2 ** 31 - len(probes)))
+                results = Parallel(n_jobs=n_w, backend='loky')(
+                    delayed(probe_compute)(
+                        source, target_fp, types, cfg,
+                        step_scale=cfg.fp_step_scale, alpha=alpha,
+                        side=label, seed=seed_base + i, calc=worker_calc)
+                    for i, (source, target_fp, alpha, label)
+                    in enumerate(probes))
+                for (source, target_fp, alpha, label), result \
+                        in zip(probes, results):
+                    new_min = self._register_probe(source, result, types,
+                                                   side=label)
+                    self._record_probe_outcome(source, new_min, target_fp, types)
+                    if new_min is not source and new_min.id not in known:
+                        known[new_min.id] = new_min
+            else:
+                for source, target_fp, alpha, label in probes:
+                    new_min = self._fp_guided_step(
+                        source, target_fp, types,
+                        step_scale=cfg.fp_step_scale,
+                        alpha=alpha, side=label)
+                    self._record_probe_outcome(source, new_min, target_fp, types)
+                    if new_min is not source and new_min.id not in known:
+                        known[new_min.id] = new_min
 
             # Cross-connect close minima
             self._cross_connect_all(known, types)
@@ -715,19 +815,23 @@ class Pallas(ProbeMixin, AnalysisMixin):
         if not A_frontier or not B_frontier:
             return []
 
+        nA = (cfg.n_probes + 1) // 2
+        nB = cfg.n_probes // 2
+        A_pick = allocate_tips(A_frontier, nA, self._probe_stats,
+                               mode=cfg.probe_alloc)
+        B_pick = allocate_tips(B_frontier, nB, self._probe_stats,
+                               mode=cfg.probe_alloc)
+
         probes = []
         for i in range(cfg.n_probes):
             alpha = max(1.0 - 0.3 * (i // 2), 0.1)
             if i % 2 == 0:
-                # A-side probe — round-robin across frontier tips
-                idx = (i // 2) % len(A_frontier)
-                src_id, tgt_fp, d = A_frontier[idx]
+                src_id, tgt_fp, d = A_frontier[A_pick[i // 2]]
                 probes.append((
                     known[src_id], tgt_fp, alpha,
                     f'A→B p{i}(α={alpha:.1f},d={d:.3f})'))
             else:
-                idx = (i // 2) % len(B_frontier)
-                src_id, tgt_fp, d = B_frontier[idx]
+                src_id, tgt_fp, d = B_frontier[B_pick[i // 2]]
                 probes.append((
                     known[src_id], tgt_fp, alpha,
                     f'B→A p{i}(α={alpha:.1f},d={d:.3f})'))
