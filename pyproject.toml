@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pallas"
+version = "1.0.0.dev0"
+description = "Phase Transition Landscape Exploration with Automated Saddle Search"
+readme = "README.md"
+license = {file = "LICENSE"}
+authors = [{name = "Li Zhu group, Rutgers-Newark"}]
+requires-python = ">=3.9"
+dependencies = [
+    "numpy",
+    "torch",
+    "ase>=3.22",
+    "networkx",
+    "scipy",
+    "joblib",
+    "spglib",
+]
+# torch_fplib is not on PyPI: pip install /Users/li/dev/torch-fplib
+# or pip install git+https://github.com/Rutgers-ZRG/torch-fplib.git
+
+[project.optional-dependencies]
+mattersim = ["mattersim"]
+test = ["pytest", "ruff"]
+
+[project.scripts]
+pallas = "pallas.cli:main"
+
+[tool.setuptools]
+packages = ["pallas"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests/unit", "tests/integration", "tests/golden"]
+markers = [
+    "unit: fast, no MLIP downloads",
+    "integration: EMT end-to-end, minutes",
+    "golden: CdSe MatterSim regression, local/nightly only",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+ignore = ["E501", "E741"]
