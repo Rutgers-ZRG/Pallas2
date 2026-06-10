@@ -70,6 +70,8 @@ def cmd_run(args):
         opt_fmax=args.fmax,
         saddle_fmax=args.saddle_fmax,
         natx=args.natx,
+        n_workers=args.n_workers,
+        probe_alloc=args.probe_alloc,
     )
     with open('config.json', 'w') as f:
         json.dump({'seed': args.seed, 'commit': _commit_id(), 'calc': args.calc,
@@ -156,6 +158,10 @@ def main(argv=None):
     pr.add_argument('--saddle-fmax', type=float, default=0.05)
     pr.add_argument('--natx', type=int, default=100)
     pr.add_argument('--seed', type=int, default=42)
+    pr.add_argument('--n-workers', type=int, default=1,
+                    help='parallel probe workers (CPU calculators only)')
+    pr.add_argument('--probe-alloc', default='adaptive',
+                    choices=['adaptive', 'round_robin'])
     pr.add_argument('--k-paths', type=int, default=1)
     pr.add_argument('--workdir', default='.')
     pr.set_defaults(func=cmd_run)
