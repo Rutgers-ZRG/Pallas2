@@ -4,26 +4,277 @@
 from copy import deepcopy as cp
 
 import numpy as np
-from ase.units import GPa
 
 from pallas.optimize import cal_saddle, local_optimization, vrand, vunit
-from pallas.structure import fp_distance
+from pallas.structure import enthalpy, fp_distance, spacegroup_label
 from pallas.xcal import XCalculator
 
 # ── Main PALLAS class ────────────────────────────────────────────────
+
+
+def gen_random_mode(structure):
+    """Random normalized generalized mode (atoms + cell rows)."""
+    natom = len(structure)
+    mode = vrand(np.zeros((natom + 3, 3)))
+    mode[0] *= 0
+    mode[-3, 1:] *= 0
+    mode[-2, 2] *= 0
+    return vunit(mode)
+
+
+def fp_gradient_mode(structure, target_fp, cfg):
+    """Compute normalized mode pointing toward target in FP space.
+
+    Uses XCalculator to get forces (position gradient) and stress
+    (cell gradient) of the FP distance, then assembles them into
+    a (natom+3, 3) dimer-compatible mode vector.
+
+    Parameters
+    ----------
+    structure : PallasAtom
+    target_fp : np.ndarray, shape (nat, fp_dim)
+
+    Returns
+    -------
+    np.ndarray, shape (natom+3, 3) — normalized mode.
+    """
+    atoms = structure.copy()
+    calc = XCalculator(
+        fp0=target_fp, znucl=cfg.znucl,
+        cutoff=cfg.fpcutoff, natx=cfg.natx)
+    atoms.calc = calc
+
+    forces = atoms.get_forces()      # (natom, 3)
+    stress = atoms.get_stress()      # (6,) Voigt
+
+    natom = len(atoms)
+    vol = atoms.get_volume()
+    jacob = (vol / natom) ** (1.0 / 3.0) * natom ** 0.5
+
+    # Voigt → 3x3 strain gradient
+    # stress_voigt = (1/V) * dE/d(epsilon)
+    # Cell descent direction: -dE/d(epsilon) = -V * stress_3x3
+    stress_3x3 = np.zeros((3, 3))
+    stress_3x3[0, 0] = stress[0]
+    stress_3x3[1, 1] = stress[1]
+    stress_3x3[2, 2] = stress[2]
+    stress_3x3[1, 2] = stress_3x3[2, 1] = stress[3]
+    stress_3x3[0, 2] = stress_3x3[2, 0] = stress[4]
+    stress_3x3[0, 1] = stress_3x3[1, 0] = stress[5]
+
+    mode = np.zeros((natom + 3, 3))
+    mode[:natom] = forces                           # position direction
+    mode[-3:] = -jacob * vol * stress_3x3           # cell direction
+
+    # Constrain redundant freedoms
+    mode[0] *= 0
+    mode[-3, 1:] *= 0
+    mode[-2, 2] *= 0
+
+    return vunit(mode)
+
+
+def fp_guided_saddle(structure, mode, step_scale, cfg,
+                     n_mode_tries=3, traj_frames=None):
+    """Perturb along FP gradient, then find saddle with aligned dimer.
+
+    Tries multiple initial mode directions from the same perturbed
+    structure: the FP gradient mode first, then mixed FP+random variants.
+    Returns the first converged saddle (negative curvature).
+
+    Parameters
+    ----------
+    structure : PallasAtom — starting minimum.
+    mode : np.ndarray — FP gradient mode (natom+3, 3).
+    step_scale : float — perturbation magnitude.
+    n_mode_tries : int — number of different initial modes to try.
+    traj_frames : list, optional — collect dimer trajectory frames.
+
+    Returns
+    -------
+    PallasAtom — saddle point (best attempt).
+    """
+    natom = len(structure)
+    vol = structure.get_volume()
+    jacob = (vol / natom) ** (1.0 / 3.0) * natom ** 0.5
+
+    # Perturb structure along FP gradient
+    perturbed = cp(structure)
+    scaled = mode * step_scale
+    cellt = perturbed.get_cell() + np.dot(perturbed.get_cell(),
+                                           scaled[-3:] / jacob)
+    perturbed.set_cell(cellt, scale_atoms=True)
+    perturbed.set_positions(perturbed.get_positions() + scaled[:-3])
+    if hasattr(perturbed, 'invalidate_fp'):
+        perturbed.invalidate_fp()
+
+    # Try multiple initial modes from this perturbed structure
+    best_saddle = None
+    best_curvature = float('inf')
+    best_frames = None
+
+    for attempt in range(n_mode_tries):
+        if attempt == 0:
+            trial_mode = mode  # pure FP gradient
+        else:
+            # Mix FP gradient with random (decreasing FP weight)
+            rand = vrand(np.zeros_like(mode))
+            mix = max(0.7 - 0.3 * attempt, 0.1)
+            trial_mode = vunit(mix * mode + (1.0 - mix) * rand)
+
+        attempt_frames = [] if traj_frames is not None else None
+        saddle = cal_saddle(cp(perturbed), fmax=cfg.saddle_fmax,
+                            steps=cfg.saddle_steps, press=cfg.press, mode=trial_mode,
+                            traj_frames=attempt_frames)
+        curv = getattr(saddle, 'dimer_curvature', None)
+
+        if curv is not None and curv < best_curvature:
+            best_curvature = curv
+            best_saddle = saddle
+            best_frames = attempt_frames
+
+        # Stop early if we found a true saddle
+        if curv is not None and curv < 0 and saddle.converged:
+            if traj_frames is not None and attempt_frames:
+                traj_frames.extend(attempt_frames)
+            return saddle
+
+    if traj_frames is not None and best_frames:
+        traj_frames.extend(best_frames)
+    return best_saddle if best_saddle is not None else saddle
+
+
+def saddle_escape(saddle, target_fp, cfg):
+    """Escape saddle toward target using dimer mode push only.
+
+    Pushes along the dimer's unstable mode in the direction toward
+    the target (determined by projecting the FP gradient onto the
+    dimer mode).  No non-physical FP bias is applied — after the push,
+    the caller should relax on the real PES via local_optimization,
+    which naturally flows to the nearest minimum without skipping
+    intermediate barriers.
+
+    Parameters
+    ----------
+    saddle : PallasAtom — saddle point with .dimer_mode attribute.
+    target_fp : np.ndarray — target fingerprints.
+
+    Returns
+    -------
+    PallasAtom — structure pushed to the target side of the saddle.
+    """
+    atoms = cp(saddle)
+    natom = len(atoms)
+    vol = atoms.get_volume()
+    jacob = (vol / natom) ** (1.0 / 3.0) * natom ** 0.5
+
+    # Get dimer's unstable mode
+    dimer_mode = getattr(saddle, 'dimer_mode', None)
+    if dimer_mode is None:
+        # Fallback: use FP gradient
+        dimer_mode = fp_gradient_mode(saddle, target_fp, cfg)
+
+    # Determine which direction along the dimer mode leads toward target:
+    # project FP gradient onto dimer mode
+    fp_mode = fp_gradient_mode(saddle, target_fp, cfg)
+    dot = np.vdot(dimer_mode, fp_mode)
+    push_dir = vunit(dimer_mode) * np.sign(dot) if abs(dot) > 1e-12 \
+        else vunit(fp_mode)
+
+    # Push along dimer mode to cross the saddle ridge
+    push_scale = cfg.fp_push_scale * 3.0
+    scaled = push_dir * push_scale
+    cellt = atoms.get_cell() + np.dot(atoms.get_cell(), scaled[-3:] / jacob)
+    atoms.set_cell(cellt, scale_atoms=True)
+    atoms.set_positions(atoms.get_positions() + scaled[:-3])
+
+    if hasattr(atoms, 'invalidate_fp'):
+        atoms.invalidate_fp()
+    return atoms
+
+
+def probe_compute(current, target_fp, types, cfg, step_scale=None,
+                  alpha=1.0, side="", seed=None, calc=None):
+    """Pure compute stage of one probe: perturb -> dimer -> escape -> optimize.
+
+    Safe to run in a worker process: touches no shared state. ``calc`` is an
+    optional picklable calculator to install in the worker (None = lazy
+    default in pallas.optimize). Returned Atoms carry SinglePointCalculators
+    so energies are readable without a live calculator.
+
+    Returns
+    -------
+    dict with keys: ok, error, saddle, e_sad, v_sad, new_min, e_min, v_min,
+    traj_frames, target_fp.
+    """
+    import random as _random
+
+    from ase.calculators.singlepoint import SinglePointCalculator
+
+    if seed is not None:
+        _random.seed(seed)
+        np.random.seed(seed)
+    if calc is not None:
+        from pallas.optimize import set_calculator
+        set_calculator(calc)
+
+    fp_mode = fp_gradient_mode(current, target_fp, cfg)
+    rand_mode = gen_random_mode(current)
+    mode = vunit(alpha * fp_mode + (1.0 - alpha) * rand_mode)
+
+    traj_frames = [current.copy()]
+    saddle = None
+    err = None
+    for attempt in range(cfg.max_retries + 1):
+        try:
+            base = cfg.fp_step_scale if step_scale is None else step_scale
+            scale = base * (0.5 ** attempt)
+            saddle = fp_guided_saddle(current, mode, scale, cfg,
+                                      traj_frames=traj_frames)
+            break
+        except Exception as e:
+            err = e
+            if attempt < cfg.max_retries:
+                print(f"  [{side}] Saddle attempt {attempt+1} failed "
+                      f"(scale={scale:.3f}): {e}, retrying...")
+    if saddle is None:
+        return {'ok': False, 'error': str(err), 'target_fp': target_fp}
+
+    e_sad = saddle.get_potential_energy()
+    v_sad = saddle.get_volume()
+
+    escaped = saddle_escape(saddle, target_fp, cfg)
+    traj_frames.append(escaped.copy())
+    new_min = local_optimization(escaped, fmax=cfg.opt_fmax,
+                                 steps=cfg.opt_steps, press=cfg.press,
+                                 traj_frames=traj_frames)
+    e_min = new_min.get_potential_energy()
+    v_min = new_min.get_volume()
+
+    for at, e in ((saddle, e_sad), (new_min, e_min)):
+        at.calc = SinglePointCalculator(at, energy=e)
+
+    return {'ok': True, 'error': None,
+            'saddle': saddle, 'e_sad': float(e_sad), 'v_sad': float(v_sad),
+            'new_min': new_min, 'e_min': float(e_min), 'v_min': float(v_min),
+            'traj_frames': traj_frames, 'target_fp': target_fp}
 
 
 class ProbeMixin:
     """FP-guided probe steps: perturb, dimer, validate, escape."""
 
     def _gen_random_velocity(self, structure):
-        """Generate random normalized velocity mode."""
-        natom = len(structure)
-        mode = vrand(np.zeros((natom + 3, 3)))
-        mode[0] *= 0
-        mode[-3, 1:] *= 0
-        mode[-2, 2] *= 0
-        return vunit(mode)
+        return gen_random_mode(structure)
+
+    def _fp_gradient_mode(self, structure, target_fp):
+        return fp_gradient_mode(structure, target_fp, self.config)
+
+    def _fp_guided_saddle(self, structure, mode, step_scale, traj_frames=None):
+        return fp_guided_saddle(structure, mode, step_scale, self.config,
+                                traj_frames=traj_frames)
+
+    def _saddle_escape(self, saddle, target_fp):
+        return saddle_escape(saddle, target_fp, self.config)
 
     def _validate_saddle(self, saddle, types):
         """Validate a saddle point: curvature check + connectivity test.
@@ -107,7 +358,7 @@ class ProbeMixin:
 
             cfg = self.config
             opt = local_optimization(atoms, fmax=cfg.opt_fmax,
-                                     steps=cfg.opt_steps)
+                                     steps=cfg.opt_steps, press=cfg.press)
             return opt
         except Exception:
             return None
@@ -116,57 +367,43 @@ class ProbeMixin:
                         step_scale, alpha=1.0, side=""):
         """One step of FP-guided chain growing (dimer from minimum).
 
-        Parameters
-        ----------
-        current : PallasAtom — current chain tip (optimized minimum).
-        target_fp : np.ndarray — target fingerprint to grow toward.
-        types : np.ndarray — atom type array.
-        step_scale : float — perturbation magnitude.
-        alpha : float — FP/random mixing ratio (1.0 = pure FP, 0.0 = pure random).
-        side : str — label for logging.
+        Compute (perturb -> dimer -> escape -> optimize) happens in
+        ``probe_compute``; registration (DB, graph, trajectories) in
+        ``_register_probe``. Serial path = compute + register in-process.
 
         Returns
         -------
-        PallasAtom — new minimum (or current if step failed).
+        PallasAtom — new minimum (or ``current`` if the step failed).
+        """
+        result = probe_compute(current, target_fp, types, self.config,
+                               step_scale=step_scale, alpha=alpha, side=side)
+        return self._register_probe(current, result, types, side=side)
+
+    def _register_probe(self, current, result, types, side=""):
+        """Register one probe result: DB rows, graph nodes/edges, traj files.
+
+        Must run in the main process (mutates shared state).
         """
         cfg = self.config
+        if not result['ok']:
+            print(f"  [{side}] All saddle attempts failed: {result['error']}")
+            return current
 
-        # Step 1: Build search mode from FP gradient + random component
-        fp_mode = self._fp_gradient_mode(current, target_fp)
-        rand_mode = self._gen_random_velocity(current)
-        mode = vunit(alpha * fp_mode + (1.0 - alpha) * rand_mode)
+        saddle, new_min = result['saddle'], result['new_min']
+        traj_frames = result['traj_frames']
 
-        # Step 2+3: Perturb along mode, run dimer with this mode
-        traj_frames = []
-        traj_frames.append(current.copy())  # starting minimum
-        saddle = None
-        for attempt in range(cfg.max_retries + 1):
-            try:
-                scale = step_scale * (0.5 ** attempt)  # halve on retry
-                saddle = self._fp_guided_saddle(
-                    current, mode, scale, traj_frames=traj_frames)
-                break
-            except Exception as e:
-                if attempt < cfg.max_retries:
-                    print(f"  [{side}] Saddle attempt {attempt+1} failed "
-                          f"(scale={scale:.3f}): {e}, retrying...")
-                else:
-                    print(f"  [{side}] All saddle attempts failed: {e}")
-                    return current
-
-        # Register saddle
         sad_id, _ = self._update_saddle(saddle)
         saddle.id = sad_id
-        h_sad = (saddle.get_volume() * cfg.press * GPa
-                 + saddle.get_potential_energy() - self.baseenergy)
+        h_sad = (enthalpy(result['e_sad'], result['v_sad'], cfg.press)
+                 - self.baseenergy)
         if sad_id not in self.G:
             self.G.add_node(sad_id, xname=f'S{sad_id}', e=h_sad,
-                            volume=saddle.get_volume())
+                            volume=result['v_sad'],
+                            spg=spacegroup_label(saddle)[0])
             self._save_to_traj(saddle, sad_id, 'saddle', h_sad)
         else:
-            h_sad = self.G.nodes[sad_id]['e']  # use stored enthalpy
+            h_sad = self.G.nodes[sad_id]['e']
 
-        # Edge: current → saddle (only if saddle is higher)
         fp_c = current.get_fp()
         fp_s = saddle.get_fp()
         d_cs = fp_distance(fp_c, fp_s, types)
@@ -175,32 +412,24 @@ class ProbeMixin:
             self.G.add_edge(current.id, sad_id,
                             weight=max(h_cur, h_sad), dist=d_cs)
         else:
-            print(f"  [{side}] Skipping edge M{current.id}→S{sad_id}: "
-                  f"saddle ({h_sad:.4f}) ≤ minimum ({h_cur:.4f})")
+            print(f"  [{side}] Skipping edge M{current.id}->S{sad_id}: "
+                  f"saddle ({h_sad:.4f}) <= minimum ({h_cur:.4f})")
 
-        # Log saddle info
         curv = getattr(saddle, 'dimer_curvature', None)
-        curv_str = f", κ={curv:.3f}" if curv is not None else ""
+        curv_str = f", k={curv:.3f}" if curv is not None else ""
 
-        # Escape saddle along dimer mode toward target, then optimize
-        escaped = self._saddle_escape(saddle, target_fp)
-        traj_frames.append(escaped.copy())  # escaped structure
-        new_min = local_optimization(escaped, fmax=cfg.opt_fmax,
-                                     steps=cfg.opt_steps,
-                                     traj_frames=traj_frames)
         min_id, _ = self._update_minima(new_min)
         new_min.id = min_id
-
-        h_min = (new_min.get_volume() * cfg.press * GPa
-                 + new_min.get_potential_energy() - self.baseenergy)
+        h_min = (enthalpy(result['e_min'], result['v_min'], cfg.press)
+                 - self.baseenergy)
         if min_id not in self.G:
             self.G.add_node(min_id, xname=f'M{min_id}', e=h_min,
-                            volume=new_min.get_volume())
+                            volume=result['v_min'],
+                            spg=spacegroup_label(new_min)[0])
             self._save_to_traj(new_min, min_id, 'minima', h_min)
         else:
-            h_min = self.G.nodes[min_id]['e']  # use stored enthalpy
+            h_min = self.G.nodes[min_id]['e']
 
-        # Edge: saddle → new minimum (only if saddle is higher)
         fp_m = new_min.get_fp()
         d_sm = fp_distance(fp_s, fp_m, types)
         traj_file = f'traj_M{current.id}_S{sad_id}_M{min_id}.extxyz'
@@ -209,191 +438,20 @@ class ProbeMixin:
                             weight=max(h_sad, h_min), dist=d_sm,
                             traj_file=traj_file)
         else:
-            print(f"  [{side}] Skipping edge S{sad_id}→M{min_id}: "
-                  f"saddle ({h_sad:.4f}) ≤ minimum ({h_min:.4f})")
+            print(f"  [{side}] Skipping edge S{sad_id}->M{min_id}: "
+                  f"saddle ({h_sad:.4f}) <= minimum ({h_min:.4f})")
 
-        # Also store traj_file on current→saddle edge
         if self.G.has_edge(current.id, sad_id):
             self.G.edges[current.id, sad_id]['traj_file'] = traj_file
 
-        # Save probe trajectory to disk
         if traj_frames:
             from ase.io import write as ase_write
             ase_write(traj_file, traj_frames)
 
-        d_target = fp_distance(fp_m, target_fp, types)
+        d_target = fp_distance(fp_m, result['target_fp'], types)
         print(f"  [{side}] S{sad_id} ({h_sad:.3f}{curv_str}) "
-              f"→ M{min_id} ({h_min:.3f}) | d(→target)={d_target:.5f}")
+              f"-> M{min_id} ({h_min:.3f}) | d(->target)={d_target:.5f}")
         return new_min
-
-    def _fp_gradient_mode(self, structure, target_fp):
-        """Compute normalized mode pointing toward target in FP space.
-
-        Uses XCalculator to get forces (position gradient) and stress
-        (cell gradient) of the FP distance, then assembles them into
-        a (natom+3, 3) dimer-compatible mode vector.
-
-        Parameters
-        ----------
-        structure : PallasAtom
-        target_fp : np.ndarray, shape (nat, fp_dim)
-
-        Returns
-        -------
-        np.ndarray, shape (natom+3, 3) — normalized mode.
-        """
-        atoms = structure.copy()
-        calc = XCalculator(
-            fp0=target_fp, znucl=self.config.znucl,
-            cutoff=self.config.fpcutoff, natx=self.config.natx)
-        atoms.calc = calc
-
-        forces = atoms.get_forces()      # (natom, 3)
-        stress = atoms.get_stress()      # (6,) Voigt
-
-        natom = len(atoms)
-        vol = atoms.get_volume()
-        jacob = (vol / natom) ** (1.0 / 3.0) * natom ** 0.5
-
-        # Voigt → 3x3 strain gradient
-        # stress_voigt = (1/V) * dE/d(epsilon)
-        # Cell descent direction: -dE/d(epsilon) = -V * stress_3x3
-        stress_3x3 = np.zeros((3, 3))
-        stress_3x3[0, 0] = stress[0]
-        stress_3x3[1, 1] = stress[1]
-        stress_3x3[2, 2] = stress[2]
-        stress_3x3[1, 2] = stress_3x3[2, 1] = stress[3]
-        stress_3x3[0, 2] = stress_3x3[2, 0] = stress[4]
-        stress_3x3[0, 1] = stress_3x3[1, 0] = stress[5]
-
-        mode = np.zeros((natom + 3, 3))
-        mode[:natom] = forces                           # position direction
-        mode[-3:] = -jacob * vol * stress_3x3           # cell direction
-
-        # Constrain redundant freedoms
-        mode[0] *= 0
-        mode[-3, 1:] *= 0
-        mode[-2, 2] *= 0
-
-        return vunit(mode)
-
-    def _fp_guided_saddle(self, structure, mode, step_scale,
-                          n_mode_tries=3, traj_frames=None):
-        """Perturb along FP gradient, then find saddle with aligned dimer.
-
-        Tries multiple initial mode directions from the same perturbed
-        structure: the FP gradient mode first, then mixed FP+random variants.
-        Returns the first converged saddle (negative curvature).
-
-        Parameters
-        ----------
-        structure : PallasAtom — starting minimum.
-        mode : np.ndarray — FP gradient mode (natom+3, 3).
-        step_scale : float — perturbation magnitude.
-        n_mode_tries : int — number of different initial modes to try.
-        traj_frames : list, optional — collect dimer trajectory frames.
-
-        Returns
-        -------
-        PallasAtom — saddle point (best attempt).
-        """
-        natom = len(structure)
-        vol = structure.get_volume()
-        jacob = (vol / natom) ** (1.0 / 3.0) * natom ** 0.5
-        cfg = self.config
-
-        # Perturb structure along FP gradient
-        perturbed = cp(structure)
-        scaled = mode * step_scale
-        cellt = perturbed.get_cell() + np.dot(perturbed.get_cell(),
-                                               scaled[-3:] / jacob)
-        perturbed.set_cell(cellt, scale_atoms=True)
-        perturbed.set_positions(perturbed.get_positions() + scaled[:-3])
-        if hasattr(perturbed, 'invalidate_fp'):
-            perturbed.invalidate_fp()
-
-        # Try multiple initial modes from this perturbed structure
-        best_saddle = None
-        best_curvature = float('inf')
-        best_frames = None
-
-        for attempt in range(n_mode_tries):
-            if attempt == 0:
-                trial_mode = mode  # pure FP gradient
-            else:
-                # Mix FP gradient with random (decreasing FP weight)
-                rand = vrand(np.zeros_like(mode))
-                mix = max(0.7 - 0.3 * attempt, 0.1)
-                trial_mode = vunit(mix * mode + (1.0 - mix) * rand)
-
-            attempt_frames = [] if traj_frames is not None else None
-            saddle = cal_saddle(cp(perturbed), fmax=cfg.saddle_fmax,
-                                steps=cfg.saddle_steps, mode=trial_mode,
-                                traj_frames=attempt_frames)
-            curv = getattr(saddle, 'dimer_curvature', None)
-
-            if curv is not None and curv < best_curvature:
-                best_curvature = curv
-                best_saddle = saddle
-                best_frames = attempt_frames
-
-            # Stop early if we found a true saddle
-            if curv is not None and curv < 0 and saddle.converged:
-                if traj_frames is not None and attempt_frames:
-                    traj_frames.extend(attempt_frames)
-                return saddle
-
-        if traj_frames is not None and best_frames:
-            traj_frames.extend(best_frames)
-        return best_saddle if best_saddle is not None else saddle
-
-    def _saddle_escape(self, saddle, target_fp):
-        """Escape saddle toward target using dimer mode push only.
-
-        Pushes along the dimer's unstable mode in the direction toward
-        the target (determined by projecting the FP gradient onto the
-        dimer mode).  No non-physical FP bias is applied — after the push,
-        the caller should relax on the real PES via local_optimization,
-        which naturally flows to the nearest minimum without skipping
-        intermediate barriers.
-
-        Parameters
-        ----------
-        saddle : PallasAtom — saddle point with .dimer_mode attribute.
-        target_fp : np.ndarray — target fingerprints.
-
-        Returns
-        -------
-        PallasAtom — structure pushed to the target side of the saddle.
-        """
-        atoms = cp(saddle)
-        natom = len(atoms)
-        vol = atoms.get_volume()
-        jacob = (vol / natom) ** (1.0 / 3.0) * natom ** 0.5
-
-        # Get dimer's unstable mode
-        dimer_mode = getattr(saddle, 'dimer_mode', None)
-        if dimer_mode is None:
-            # Fallback: use FP gradient
-            dimer_mode = self._fp_gradient_mode(saddle, target_fp)
-
-        # Determine which direction along the dimer mode leads toward target:
-        # project FP gradient onto dimer mode
-        fp_mode = self._fp_gradient_mode(saddle, target_fp)
-        dot = np.vdot(dimer_mode, fp_mode)
-        push_dir = vunit(dimer_mode) * np.sign(dot) if abs(dot) > 1e-12 \
-            else vunit(fp_mode)
-
-        # Push along dimer mode to cross the saddle ridge
-        push_scale = self.config.fp_push_scale * 3.0
-        scaled = push_dir * push_scale
-        cellt = atoms.get_cell() + np.dot(atoms.get_cell(), scaled[-3:] / jacob)
-        atoms.set_cell(cellt, scale_atoms=True)
-        atoms.set_positions(atoms.get_positions() + scaled[:-3])
-
-        if hasattr(atoms, 'invalidate_fp'):
-            atoms.invalidate_fp()
-        return atoms
 
     def _fp_guided_push(self, saddle, target_fp):
         """Small FP-guided push on saddle toward target.

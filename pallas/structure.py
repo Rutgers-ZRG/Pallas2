@@ -53,6 +53,47 @@ class PallasAtom(Atoms):
         self.fp = None
 
 
+def enthalpy(energy, volume, press):
+    """H = E + P*V. ``press`` is in eV/A^3 (PALLAS internal pressure unit)."""
+    return energy + press * volume
+
+
+def spacegroup_label(atoms, symprecs=(1e-5, 1e-3, 1e-2, 1e-1)):
+    """Space-group label of a structure, robust to slight distortion.
+
+    Tries symprec from tight to loose and returns the first result that is
+    confirmed by the next-looser tolerance (a "stable" assignment). If no
+    two adjacent tolerances agree, returns the tightest result rather than
+    overclaiming symmetry. Never raises: worst case is ('P1', 1).
+
+    Returns
+    -------
+    (international_symbol, number) : (str, int)
+    """
+    import spglib
+
+    cell = (atoms.get_cell()[:], atoms.get_scaled_positions(),
+            atoms.get_atomic_numbers())
+    results = []
+    for sp in sorted(symprecs):
+        try:
+            ds = spglib.get_symmetry_dataset(cell, symprec=sp)
+        except Exception:
+            ds = None
+        if ds is None:
+            continue
+        try:
+            results.append((ds.international, int(ds.number)))
+        except AttributeError:  # spglib < 2.5 returns a dict
+            results.append((ds['international'], int(ds['number'])))
+    if not results:
+        return ('P1', 1)
+    for i in range(len(results) - 1):
+        if results[i] == results[i + 1]:
+            return results[i]
+    return results[0]
+
+
 def fp_distance(fp1, fp2, types):
     """Hungarian-matched fingerprint distance between two structures.
 

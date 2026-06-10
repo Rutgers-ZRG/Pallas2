@@ -18,6 +18,7 @@ dependencies = [
     "scipy",
     "joblib",
     "spglib",
+    "matplotlib",
 ]
 # torch_fplib is not on PyPI: pip install /Users/li/dev/torch-fplib
 # or pip install git+https://github.com/Rutgers-ZRG/torch-fplib.git
