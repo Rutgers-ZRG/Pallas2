@@ -6,8 +6,9 @@ Usage:
     python -m pallas.export_path -d workdir         # specify directory
     python -m pallas.export_path -p 1 15 12 21 10 9 2  # explicit path
 """
-import os
 import argparse
+import os
+
 import ase.db
 import joblib
 from ase.io import write
@@ -51,7 +52,6 @@ def export_pathway(db_file='pallas.db', graph_file='graph.pkl',
 
         fname = f"{i:02d}_{xname}.vasp"
         fpath = os.path.join(outdir, fname)
-        comment = f"{xname} H={h:.4f} eV V={atoms.get_volume():.1f}"
         write(fpath, atoms, format='vasp', direct=True, sort=True)
 
         print(f"  {fname}: {ntype} {xname}, H={h:.4f} eV, "

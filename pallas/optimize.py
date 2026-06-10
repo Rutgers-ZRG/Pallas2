@@ -5,15 +5,13 @@ Provides local structure optimization (MatterSim) and saddle point search
 first use.
 """
 
-import numpy as np
 from copy import deepcopy as cp
 
-from ase.io import read, write, Trajectory
-from ase.optimize import FIRE, BFGS
+import numpy as np
 from ase.filters import FrechetCellFilter
+from ase.optimize import FIRE
 
 from pallas.dimer import SolidStateDimer
-
 
 # ── Vector utilities ──────────────────────────────────────────────────
 

@@ -5,7 +5,6 @@ The stress model output is converted from NequIP internal units (kbar-like)
 to eV/A^3 via the factor 1/1602.1766.
 """
 
-import numpy as np
 from ase.calculators.calculator import Calculator, all_changes
 
 

@@ -6,13 +6,13 @@ This module provides an implementation of the dimer method for finding
 transition states on potential energy surfaces, with extensions for
 solid-state systems allowing cell optimization.
 
-This implementation is derived from the TSASE (Transition State Library for ASE) 
+This implementation is derived from the TSASE (Transition State Library for ASE)
 package but has been significantly refactored and optimized.
 """
 
+from math import atan, cos, pi, sin, tan
+
 import numpy as np
-from math import sqrt, atan, cos, sin, tan, pi
-from typing import Optional, Union, Tuple, List, Any
 
 # Numerical constants
 ROTATION_ANGLE = 0.02  # Small rotation angle for projecting out rotational modes
@@ -24,23 +24,23 @@ MAX_ROTATION_ITERATIONS = 10  # Maximum number of rotations in a single step
 class SolidStateDimer:
     """
     Implementation of the Solid State Dimer method for transition state search.
-    
+
     The dimer method is a minimum mode following algorithm that efficiently
     searches for transition states without requiring calculation of the Hessian matrix.
     This implementation extends the original dimer method to handle periodic systems
     with variable cell shapes.
-    
+
     This class is derived from the TSASE (Transition State Library for ASE)
     package but has been significantly refactored and optimized.
     """
 
-    def __init__(self, atoms=None, mode=None, max_step=0.2, time_step=0.1, 
-                 dimer_separation=0.001, rotation_tolerance=15.0, max_rotations=4, 
-                 solid_state=True, external_stress=None, rotation_method='cg', 
+    def __init__(self, atoms=None, mode=None, max_step=0.2, time_step=0.1,
+                 dimer_separation=0.001, rotation_tolerance=15.0, max_rotations=4,
+                 solid_state=True, external_stress=None, rotation_method='cg',
                  cell_weight=1.0, project_translations_rotations=True):
         """
         Initialize the Solid State Dimer method.
-        
+
         Parameters
         ----------
         atoms : Atoms object
@@ -62,7 +62,7 @@ class SolidStateDimer:
         external_stress : ndarray, optional
             External stress tensor (3x3 matrix, must be in lower triangular form)
         rotation_method : str, default='cg'
-            Method for optimizing rotation: 'sd' (steepest descent), 
+            Method for optimizing rotation: 'sd' (steepest descent),
             'cg' (conjugate gradient), or 'bfgs'
         cell_weight : float, default=1.0
             Weight factor for cell degrees of freedom
@@ -72,41 +72,41 @@ class SolidStateDimer:
         # Store reference to atoms object
         self.atoms = atoms
         self.num_atoms = len(atoms) if atoms is not None else 0
-        
+
         # Dimer parameters
         self.max_step = max_step
         self.time_step = time_step
         self.dimer_separation = dimer_separation
         self.rotation_tolerance = rotation_tolerance * pi / 180.0  # Convert to radians
         self.max_rotations = max_rotations
-        
+
         # System parameters
         self.solid_state = solid_state
         self.external_stress = np.zeros((3, 3)) if external_stress is None else external_stress
         self.cell_weight = cell_weight
         self.project_translations_rotations = project_translations_rotations
-        
+
         # Force evaluation counter
         self.force_evaluations = 0
-        
+
         # Initialize mode vector
         self._initialize_mode(mode)
-        
+
         # Initialize rotation parameters
         self.rotation_method = rotation_method
         self.rotation_direction = np.zeros_like(self.mode)
         self.rotation_direction_norm = 0.0
-        
+
         # Initialize cell parameters for solid state
         self._setup_cell_parameters()
-        
+
         # Initialize dimer images (replicas of atoms)
         self._initialize_dimer_images()
-        
+
         # Initialize optimization state
         self.curvature = None
         self.modified_forces = None
-        
+
         # BFGS specific parameters
         if self.rotation_method == 'bfgs':
             self._setup_bfgs()
@@ -114,11 +114,11 @@ class SolidStateDimer:
     def _setup_bfgs(self):
         """Initialize matrices for BFGS optimization method."""
         ndim = (self.num_atoms + 3) * 3 if self.solid_state else self.num_atoms * 3
-        
+
         # Initial Hessian and its inverse
         self.bfgs_hessian_0 = np.eye(ndim) * BFGS_INITIAL_SCALE
         self.bfgs_hessian = self.bfgs_hessian_0.copy()
-        
+
         self.bfgs_inv_hessian_0 = np.eye(ndim) / BFGS_INITIAL_SCALE
         self.bfgs_inv_hessian = self.bfgs_inv_hessian_0.copy()
 
@@ -128,7 +128,7 @@ class SolidStateDimer:
             mode_shape = (self.num_atoms + 3, 3)
         else:
             mode_shape = (self.num_atoms, 3)
-            
+
         if mode is None:
             # Create random initial mode
             self.mode = self._random_vector(np.zeros(mode_shape))
@@ -140,7 +140,7 @@ class SolidStateDimer:
             self.mode = np.vstack((mode, np.zeros((3, 3))))
         else:
             self.mode = mode.copy()
-            
+
         # Normalize the mode vector
         self.mode = self._normalize_vector(self.mode)
 
@@ -149,7 +149,7 @@ class SolidStateDimer:
         if not self.solid_state or self.atoms is None:
             self.jacobian = 1.0
             return
-            
+
         # Calculate Jacobian factor for cell degrees of freedom
         vol = self.atoms.get_volume()
         avg_length = (vol / self.num_atoms) ** (1.0 / 3.0)
@@ -159,11 +159,11 @@ class SolidStateDimer:
         """Initialize the dimer endpoint images."""
         if self.atoms is None:
             return
-            
+
         # Create copies for dimer endpoints
         self.dimer_image = self.atoms.copy()
         self.trial_image = self.atoms.copy()
-        
+
         # Ensure calculators are propagated
         calc = self.atoms.calc
         self.dimer_image.calc = calc
@@ -172,12 +172,12 @@ class SolidStateDimer:
     def _vector_magnitude(self, vector):
         """
         Calculate the magnitude (Euclidean norm) of a vector.
-        
+
         Parameters
         ----------
         vector : ndarray
             Input vector or array
-            
+
         Returns
         -------
         float
@@ -188,12 +188,12 @@ class SolidStateDimer:
     def _normalize_vector(self, vector):
         """
         Normalize a vector to unit length.
-        
+
         Parameters
         ----------
         vector : ndarray
             Input vector or array
-            
+
         Returns
         -------
         ndarray
@@ -207,12 +207,12 @@ class SolidStateDimer:
     def _random_vector(self, shape_like):
         """
         Generate a random unit vector with the same shape as the input.
-        
+
         Parameters
         ----------
         shape_like : ndarray
             Array with the desired shape
-            
+
         Returns
         -------
         ndarray
@@ -224,17 +224,17 @@ class SolidStateDimer:
     def get_positions(self):
         """
         Get positions in the generalized coordinate space.
-        
+
         For solid state calculations, returns zeros to make vector operations
         work properly with the optimizer.
-        
+
         Returns
         -------
         ndarray
             Positions array (or zeros for solid state)
         """
         positions = self.atoms.get_positions()
-        
+
         if self.solid_state:
             # Return zeros so the vector passed to set_positions is just
             # the displacement in the generalized space
@@ -249,9 +249,9 @@ class SolidStateDimer:
     def set_positions(self, displacement):
         """
         Set positions in the generalized coordinate space.
-        
+
         For solid state, updates both atomic positions and cell vectors.
-        
+
         Parameters
         ----------
         displacement : ndarray
@@ -262,7 +262,7 @@ class SolidStateDimer:
             cell = self.atoms.get_cell()
             cell += np.dot(cell, displacement[-3:]) / self.jacobian
             self.atoms.set_cell(cell, scale_atoms=True)
-            
+
             # Update atom positions
             positions = self.atoms.get_positions() + displacement[:-3]
             self.atoms.set_positions(positions)
@@ -273,7 +273,7 @@ class SolidStateDimer:
     def _update_dimer_endpoint(self, direction, reference, endpoint):
         """
         Set the position of a dimer endpoint.
-        
+
         Parameters
         ----------
         direction : ndarray
@@ -285,13 +285,13 @@ class SolidStateDimer:
         """
         # Calculate displacement vector
         displacement = self.dimer_separation * direction
-        
+
         # Update cell for solid state
         cell0 = reference.get_cell()
         if self.solid_state:
             cell1 = cell0 + np.dot(cell0, displacement[-3:]) / self.jacobian
             endpoint.set_cell(cell1, scale_atoms=True)
-            
+
             # Update atom positions in new cell
             scaled_positions = reference.get_scaled_positions()
             positions = np.dot(scaled_positions, cell1) + displacement[:-3]
@@ -304,15 +304,15 @@ class SolidStateDimer:
     def _calculate_general_forces(self, atoms_obj):
         """
         Calculate the general forces (atomic forces and stress).
-        
+
         For solid state systems, combines atomic forces and stress
         into a single generalized force vector.
-        
+
         Parameters
         ----------
         atoms_obj : Atoms
             Atoms object to calculate forces for
-            
+
         Returns
         -------
         ndarray
@@ -320,12 +320,12 @@ class SolidStateDimer:
         """
         self.force_evaluations += 1
         forces = atoms_obj.get_forces()
-        
+
         if self.solid_state:
             # Get stress and convert to 3x3 matrix
             stress = atoms_obj.get_stress()
             volume = -atoms_obj.get_volume()
-            
+
             stress_matrix = np.zeros((3, 3))
             # Convert from Voigt notation to 3x3 matrix
             stress_matrix[0, 0] = stress[0] * volume
@@ -334,10 +334,10 @@ class SolidStateDimer:
             stress_matrix[2, 1] = stress[3] * volume
             stress_matrix[2, 0] = stress[4] * volume
             stress_matrix[1, 0] = stress[5] * volume
-            
+
             # Apply external stress
             stress_matrix -= self.external_stress * (-1) * volume
-            
+
             # Combine forces and stress
             return np.vstack((forces, stress_matrix / self.jacobian))
         else:
@@ -346,14 +346,14 @@ class SolidStateDimer:
     def _project_out_translations_rotations(self, vector, atoms_obj):
         """
         Project out rigid translation and rotation modes from a vector.
-        
+
         Parameters
         ----------
         vector : ndarray
             Vector to project
         atoms_obj : Atoms
             Reference atoms object
-            
+
         Returns
         -------
         ndarray
@@ -361,24 +361,24 @@ class SolidStateDimer:
         """
         if not self.project_translations_rotations:
             return vector
-            
+
         # Project out translations (3 modes)
         for axis in range(3):
             trans_vec = np.zeros_like(vector)
             trans_vec[:self.num_atoms, axis] = 1.0
             trans_vec = self._normalize_vector(trans_vec)
             vector -= np.vdot(vector, trans_vec) * trans_vec
-            
+
         # Project out rotations (3 modes)
         for axis in ['x', 'y', 'z']:
             # Create rotated structure
             rotated = atoms_obj.copy()
             rotated.rotate(axis, ROTATION_ANGLE, center='COM', rotate_cell=False)
-            
+
             # Calculate rotation vector
             rot_vec = rotated.get_positions() - atoms_obj.get_positions()
             rot_vec = self._normalize_vector(rot_vec.reshape(-1, 3))
-            
+
             # Only project from atomic part, not cell part
             if self.solid_state:
                 projection = np.vdot(vector[:-3].reshape(-1), rot_vec.reshape(-1))
@@ -388,13 +388,13 @@ class SolidStateDimer:
             else:
                 projection = np.vdot(vector.reshape(-1), rot_vec.reshape(-1))
                 vector -= projection * rot_vec.reshape(vector.shape)
-                
+
         return vector
 
     def _update_rotation_direction(self, perp_force, old_perp_force, old_mode):
         """
         Determine the optimal rotation direction using the specified method.
-        
+
         Parameters
         ----------
         perp_force : ndarray
@@ -407,63 +407,63 @@ class SolidStateDimer:
         if self.rotation_method == 'sd':
             # Steepest descent: simply rotate toward the perpendicular force
             self.rotation_direction = self._normalize_vector(perp_force)
-            
+
         elif self.rotation_method == 'cg':
             # Conjugate gradient method
             dot_product = abs(np.vdot(perp_force, old_perp_force))
             old_force_sq = np.vdot(old_perp_force, old_perp_force)
-            
+
             # Calculate mixing parameter
             if dot_product <= 0.5 * old_force_sq and old_force_sq > EPSILON:
                 gamma = np.vdot(perp_force, perp_force - old_perp_force) / old_force_sq
             else:
                 gamma = 0.0
-                
+
             # Update rotation direction
             mixed_direction = perp_force + gamma * self.rotation_direction * self.rotation_direction_norm
-            
+
             # Ensure orthogonality to mode
             mixed_direction -= np.vdot(mixed_direction, self.mode) * self.mode
-            
+
             self.rotation_direction_norm = self._vector_magnitude(mixed_direction)
             self.rotation_direction = self._normalize_vector(mixed_direction)
-            
+
         elif self.rotation_method == 'bfgs':
             # BFGS optimization for rotation
-            
+
             # Calculate step and gradient vectors
             step = (self.mode - old_mode).flatten()
             grad_new = -perp_force.flatten() / self.dimer_separation
             grad_old = -old_perp_force.flatten() / self.dimer_separation
             grad_diff = grad_new - grad_old
-            
+
             # BFGS Hessian update
             dot1 = np.dot(step, grad_diff)
             hessian_step = np.dot(self.bfgs_hessian, step)
             dot2 = np.dot(step, hessian_step)
-            
+
             # Skip update if denominators are too small
             if abs(dot1) > EPSILON and abs(dot2) > EPSILON:
                 self.bfgs_hessian += np.outer(grad_diff, grad_diff) / dot1 - np.outer(hessian_step, hessian_step) / dot2
-                
+
             # Compute search direction using eigendecomposition
             eigenvalues, eigenvectors = np.linalg.eigh(self.bfgs_hessian)
             search_dir = np.dot(
-                eigenvectors, 
+                eigenvectors,
                 np.dot(-grad_new, eigenvectors) / np.abs(eigenvalues)
             ).reshape(self.mode.shape)
-            
+
             # Check alignment with steepest descent direction
             alignment = np.vdot(
                 self._normalize_vector(search_dir),
                 self._normalize_vector(perp_force)
             )
-            
+
             # Reset BFGS if search direction is suspicious
             if alignment < BFGS_RESET_THRESHOLD:
                 search_dir = perp_force
                 self.bfgs_hessian = self.bfgs_hessian_0.copy()
-                
+
             # Ensure search direction is perpendicular to mode
             search_dir -= np.vdot(search_dir, self.mode) * self.mode
             self.rotation_direction = self._normalize_vector(search_dir)
@@ -471,11 +471,11 @@ class SolidStateDimer:
     def find_minimum_mode(self):
         """
         Find the minimum curvature mode by rotating the dimer.
-        
+
         This is the core algorithm of the dimer method that identifies
         the direction of lowest curvature (negative eigenvalue) on the
         potential energy surface.
-        
+
         Returns
         -------
         ndarray
@@ -487,7 +487,7 @@ class SolidStateDimer:
 
         # Calculate initial forces
         central_forces = self._calculate_general_forces(self.atoms)
-        
+
         # Set up and get forces for first dimer endpoint
         self._update_dimer_endpoint(self.mode, self.atoms, self.dimer_image)
         dimer_forces = self._calculate_general_forces(self.dimer_image)
@@ -496,7 +496,7 @@ class SolidStateDimer:
         phi_min = 1.5  # Initial value > tolerance to enter loop
         perp_force = np.zeros_like(dimer_forces)  # Initialize to avoid reference error
         iteration = 0
-        
+
         # Main rotation loop
         while abs(phi_min) > self.rotation_tolerance and iteration < self.max_rotations:
             # First iteration: compute initial perpendicular forces
@@ -504,7 +504,7 @@ class SolidStateDimer:
                 # Calculate perpendicular components
                 central_perp = central_forces - np.vdot(central_forces, self.mode) * self.mode
                 dimer_perp = dimer_forces - np.vdot(dimer_forces, self.mode) * self.mode
-                
+
                 # Effective perpendicular force (factor of 2.0 from dimer method theory)
                 perp_force = 2.0 * (dimer_perp - central_perp)
                 self.rotation_direction = self._normalize_vector(perp_force)
@@ -518,10 +518,10 @@ class SolidStateDimer:
             # Calculate curvature and its derivative
             curvature = np.vdot(central_forces - dimer_forces, self.mode) / self.dimer_separation
             curvature_derivative = np.vdot(central_forces - dimer_forces, self.rotation_direction) / self.dimer_separation * 2.0
-            
+
             # Initial rotation angle estimate
             phi_1 = -0.5 * atan(curvature_derivative / (2.0 * max(abs(curvature), EPSILON)))
-            
+
             # Early exit if rotation angle is already small
             if abs(phi_1) <= self.rotation_tolerance:
                 break
@@ -533,12 +533,12 @@ class SolidStateDimer:
             self._update_dimer_endpoint(trial_mode, self.atoms, self.trial_image)
             trial_forces = self._calculate_general_forces(self.trial_image)
             trial_curvature = np.vdot(central_forces - trial_forces, trial_mode) / self.dimer_separation
-            
+
             # Fit curvature to c(φ) = a0/2 + a1*cos(2φ) + b1*sin(2φ)
             b1 = 0.5 * curvature_derivative
             a1 = (curvature - trial_curvature + b1 * sin(2 * phi_1)) / max(1 - cos(2 * phi_1), EPSILON)
             a0 = 2.0 * (curvature - a1)
-            
+
             # Calculate optimal rotation angle (a1 can be negative — do NOT clip)
             phi_min = 0.5 * atan(b1 / a1)
             min_curvature = 0.5 * a0 + a1 * cos(2.0 * phi_min) + b1 * sin(2 * phi_min)
@@ -547,23 +547,23 @@ class SolidStateDimer:
             if min_curvature > curvature:
                 phi_min += pi * 0.5
                 min_curvature = 0.5 * a0 + a1 * cos(2.0 * phi_min) + b1 * sin(2 * phi_min)
-                
+
             # Normalize angle for numerical stability
             if phi_min > pi * 0.5:
                 phi_min -= pi
-                
+
             # Save current mode for rotation optimization
             old_mode = self.mode.copy()
-            
+
             # Update dimer direction
             self.mode = self._normalize_vector(
                 self.mode * cos(phi_min) + self.rotation_direction * sin(phi_min)
             )
-            
+
             # Project out translations and rotations
             if self.project_translations_rotations and not self.solid_state:
                 self.mode = self._project_out_translations_rotations(self.mode, self.atoms)
-                
+
             # Update curvature
             curvature = min_curvature
 
@@ -580,12 +580,12 @@ class SolidStateDimer:
             dimer_perp = dimer_forces - np.vdot(dimer_forces, self.mode) * self.mode
             old_perp_force = perp_force
             perp_force = 2.0 * (dimer_perp - central_perp)
-            
+
             # Calculate rotation direction for next iteration
             self._update_rotation_direction(perp_force, old_perp_force, old_mode)
 
             iteration += 1
-            
+
         # Store final curvature and return forces
         self.curvature = curvature
         return central_forces
@@ -593,7 +593,7 @@ class SolidStateDimer:
     def get_curvature(self):
         """
         Return the current curvature along the dimer axis.
-        
+
         Returns
         -------
         float
@@ -604,7 +604,7 @@ class SolidStateDimer:
     def get_mode(self):
         """
         Return the current dimer mode (direction of lowest curvature).
-        
+
         Returns
         -------
         ndarray
@@ -618,10 +618,10 @@ class SolidStateDimer:
     def get_forces(self):
         """
         Calculate modified forces for the dimer method.
-        
+
         The dimer method modifies the potential energy surface forces to
         create an effective force that drives the system toward saddle points.
-        
+
         Returns
         -------
         ndarray
@@ -629,11 +629,11 @@ class SolidStateDimer:
         """
         # Find the minimum mode direction and calculate true forces
         true_forces = self.find_minimum_mode()
-        
+
         # Project forces along the dimer direction
         parallel_component = np.vdot(true_forces, self.mode) * self.mode
         perpendicular_component = true_forces - parallel_component
-        
+
         # Dimer force modification
         if self.curvature > 0:
             # At a minimum along mode direction - invert the parallel component

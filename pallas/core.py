@@ -10,26 +10,24 @@ Dependencies: torch_fplib, ASE, NetworkX, joblib, scipy.
 """
 
 import os
-import sys
 from copy import deepcopy as cp
 from dataclasses import dataclass, field
 
-import numpy as np
-import networkx as nx
-import joblib
-from ase import Atoms
-from ase.io import read, write
-from ase.optimize import FIRE
-from ase.filters import FrechetCellFilter
-from ase.units import GPa
 import ase.db
-
+import joblib
+import networkx as nx
+import numpy as np
 import torch
 import torch_fplib
-from pallas.xcal import XCalculator, atoms_to_cell, fp_dist_with_assignment
-from pallas.optimize import local_optimization, cal_saddle, vunit, vrand, _get_calculator
-from pallas.graph import minimax_path, minimax_path_kinetic
+from ase import Atoms
+from ase.filters import FrechetCellFilter
+from ase.io import read, write
+from ase.optimize import FIRE
+from ase.units import GPa
 
+from pallas.graph import minimax_path_kinetic
+from pallas.optimize import cal_saddle, local_optimization, vrand, vunit
+from pallas.xcal import XCalculator, atoms_to_cell, fp_dist_with_assignment
 
 # ── Configuration ─────────────────────────────────────────────────────
 
@@ -333,7 +331,7 @@ class Pallas:
                     print(f"  barrier={barrier:.4f} "
                           f"(stagnant {stagnant}/{cfg.patience})")
             except nx.NetworkXNoPath:
-                print(f"  No path yet")
+                print("  No path yet")
 
             self._save_state()
 
@@ -992,18 +990,18 @@ class Pallas:
                 else:
                     print(f"    No improvement (barrier still {best_bn:.4f})")
             except nx.NetworkXNoPath:
-                print(f"    Path lost during refinement")
+                print("    Path lost during refinement")
 
             self._save_state()
 
             # Early stop if no improvement for 2 consecutive rounds
             if best_bn >= prev_bn and rnd > 0:
-                print(f"    Stopping: no improvement for 2 rounds")
+                print("    Stopping: no improvement for 2 rounds")
                 break
             prev_bn = best_bn
 
         # Final report
-        print(f"\nRefinement complete.")
+        print("\nRefinement complete.")
         print(f"Final barrier: {best_bn:.4f} eV")
         print(f"Final path: {' -> '.join(str(n) for n in best_path)}")
         for node in best_path:
@@ -1095,7 +1093,6 @@ class Pallas:
         """
         try:
             atoms = cp(saddle)
-            natom = len(atoms)
             scaled = mode * push_scale
             cellt = atoms.get_cell() + np.dot(atoms.get_cell(),
                                               scaled[-3:] / jacob)
@@ -1955,7 +1952,8 @@ class Pallas:
         -------
         list of Atoms — ordered structures along the path.
         """
-        from ase.io import write as ase_write, read as ase_read
+        from ase.io import read as ase_read
+        from ase.io import write as ase_write
 
         smooth_traj = []
         used_files = set()
@@ -2124,7 +2122,7 @@ class Pallas:
         print(f"End M{path[-1]}: H = {h_end:.4f} eV")
         print(f"\nOverall forward barrier (max saddle - start): "
               f"{forward_barrier:.4f} eV ({forward_barrier/nat:.4f} eV/atom)")
-        print(f"Rate-limiting step: ", end="")
+        print("Rate-limiting step: ", end="")
         if rate_limiting and rate_limiting['saddle'] is not None:
             print(f"M{rate_limiting['min_before']} -> "
                   f"S{rate_limiting['saddle']} -> "
@@ -2214,7 +2212,7 @@ def listpath(graph_file='graph.pkl', db_file='pallas.db',
                 cumulative_dist += d
                 f.write(f"  → next: weight={w:.6f}, dist={d:.6f}\n")
 
-    print(f"Output written to path_output/")
+    print("Output written to path_output/")
 
 
 # ── Entry points ──────────────────────────────────────────────────────
