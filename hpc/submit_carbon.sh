@@ -6,9 +6,10 @@
 #SBATCH --job-name=pallas_c_nodrag
 #SBATCH --output=%x_%j.out
 #SBATCH --error=%x_%j.err
+#SBATCH --cpus-per-task=4
 
-module purge
-eval "$(conda shell.bash hook)" && conda activate nequip
+source /home/lz432/miniconda3/etc/profile.d/conda.sh
+conda activate nequip
 cd "$SLURM_SUBMIT_DIR"
 export PYTHONPATH=/scratch/lz432/pallas_nodrag/Pallas2:/scratch/lz432/pallas_nodrag/torch-fplib:$PYTHONPATH
 python -u run_carbon_nodrag.py
