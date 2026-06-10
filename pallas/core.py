@@ -43,7 +43,8 @@ class PallasConfig:
 
     # System
     znucl: list = field(default_factory=list)   # atomic numbers in type order
-    press: float = 0.0                          # external pressure (GPa)
+    press: float = 0.0                          # external pressure (eV/A^3)
+    pressure_gpa: float = None                  # external pressure (GPa); converted to press
 
     # PSO parameters
     maxstep: int = 50
@@ -77,6 +78,12 @@ class PallasConfig:
     max_gen: int = 50               # max generations
     patience: int = 5               # stop after N gens without barrier improvement
     min_barrier_change: float = 0.001  # minimum improvement to reset patience (eV)
+
+    def __post_init__(self):
+        if self.pressure_gpa is not None:
+            if self.press != 0.0:
+                raise ValueError("Give press (eV/A^3) or pressure_gpa, not both")
+            self.press = self.pressure_gpa * GPa  # ase.units.GPa = eV/A^3 per GPa
 
 
 # ── PallasAtom: Atoms with fingerprint caching ────────────────────────
