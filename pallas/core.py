@@ -11,144 +11,21 @@ Dependencies: torch_fplib, ASE, NetworkX, joblib, scipy.
 
 import os
 from copy import deepcopy as cp
-from dataclasses import dataclass, field
 
 import ase.db
 import joblib
 import networkx as nx
 import numpy as np
-import torch
-import torch_fplib
-from ase import Atoms
 from ase.filters import FrechetCellFilter
 from ase.io import read, write
 from ase.optimize import FIRE
 from ase.units import GPa
 
+from pallas.config import PallasConfig
 from pallas.graph import minimax_path_kinetic
 from pallas.optimize import cal_saddle, local_optimization, vrand, vunit
-from pallas.xcal import XCalculator, atoms_to_cell, fp_dist_with_assignment
-
-# ── Configuration ─────────────────────────────────────────────────────
-
-@dataclass
-class PallasConfig:
-    """Configuration for PALLAS pathway search."""
-    # Fingerprint parameters
-    fpcutoff: float = 5.5
-    natx: int = 200
-    lmax: int = 0       # 0 = s-only, 1 = s+p
-
-    # System
-    znucl: list = field(default_factory=list)   # atomic numbers in type order
-    press: float = 0.0                          # external pressure (eV/A^3)
-    pressure_gpa: float = None                  # external pressure (GPa); converted to press
-
-    # PSO parameters
-    maxstep: int = 50
-    popsize: int = 10
-    velocity_weight: float = 0.9
-    c1: float = 2.0     # personal best weight
-    c2: float = 1.5     # global best weight
-
-    # Optimization step limits
-    opt_steps: int = 2000           # max FIRE steps for local optimization
-    opt_fmax: float = 0.001         # force convergence for optimization
-    saddle_steps: int = 2000        # max FIRE steps for dimer saddle search
-    saddle_fmax: float = 0.01       # force convergence for saddle
-    bias_steps: int = 60            # max FIRE steps for FP bias relaxation
-
-    # FP-guided search parameters
-    fp_step_scale: float = 0.05     # perturbation scale along FP gradient (small to stay near basin)
-    fp_push_scale: float = 0.05     # post-saddle push scale toward target
-    max_retries: int = 2            # retries with smaller step on saddle failure
-
-    # Barrier refinement parameters
-    refine_rounds: int = 3          # number of refinement iterations
-    refine_probes: int = 5          # saddle searches per refinement round
-
-    # Convergence
-    ediff: float = 0.005            # energy diff threshold, whole cell (eV)
-    dist_threshold: float = 0.005   # FP distance threshold for same structure
-
-    # Generational search parameters (used by run())
-    n_probes: int = 5               # probes per generation
-    max_gen: int = 50               # max generations
-    patience: int = 5               # stop after N gens without barrier improvement
-    min_barrier_change: float = 0.001  # minimum improvement to reset patience (eV)
-
-    def __post_init__(self):
-        if self.pressure_gpa is not None:
-            if self.press != 0.0:
-                raise ValueError("Give press (eV/A^3) or pressure_gpa, not both")
-            self.press = self.pressure_gpa * GPa  # ase.units.GPa = eV/A^3 per GPa
-
-
-# ── PallasAtom: Atoms with fingerprint caching ────────────────────────
-
-class PallasAtom(Atoms):
-    """ASE Atoms subclass with cached fingerprints and metadata.
-
-    Fingerprints are computed via torch_fplib and cached until invalidated.
-    """
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.natx = 200
-        self.fpcutoff = 5.5
-        self.fp = None
-        self.converged = False
-        self.id = None
-        self._znucl = None
-
-    @property
-    def znucl(self):
-        return self._znucl
-
-    @znucl.setter
-    def znucl(self, val):
-        self._znucl = list(val) if val is not None else None
-
-    def get_fp(self):
-        """Return cached fingerprints, computing if needed."""
-        if self.fp is None:
-            self.fp = self.cal_fp()
-        return self.fp
-
-    def cal_fp(self):
-        """Compute GOM fingerprints via torch_fplib."""
-        if self._znucl is None or len(self._znucl) == 0:
-            raise ValueError("znucl not set on PallasAtom")
-        lat_np, rxyz_np, types, znucl = atoms_to_cell(self, self._znucl)
-        with torch.no_grad():
-            fp = torch_fplib.get_lfp(
-                (lat_np, rxyz_np, types, znucl),
-                cutoff=self.fpcutoff, natx=self.natx, orbital='s'
-            )
-        return fp.numpy()
-
-    def invalidate_fp(self):
-        """Clear cached fingerprint (call after position/cell changes)."""
-        self.fp = None
-
-
-# ── Fingerprint distance helper ───────────────────────────────────────
-
-def fp_distance(fp1, fp2, types):
-    """Hungarian-matched fingerprint distance between two structures.
-
-    Parameters
-    ----------
-    fp1, fp2 : np.ndarray, shape (nat, fp_dim)
-    types : array-like, shape (nat,)  — 1-indexed atom types.
-
-    Returns
-    -------
-    float — averaged FP distance.
-    """
-    d, _ = fp_dist_with_assignment(fp1, fp2, types)
-    return d
-
+from pallas.structure import PallasAtom, fp_distance
+from pallas.xcal import XCalculator
 
 # ── Main PALLAS class ────────────────────────────────────────────────
 
