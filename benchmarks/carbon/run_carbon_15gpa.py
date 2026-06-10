@@ -15,7 +15,8 @@ import time
 
 import numpy as np
 
-SEED = 42
+import sys as _sys
+SEED = int(_sys.argv[1]) if len(_sys.argv) > 1 else 42
 random.seed(SEED)
 np.random.seed(SEED)
 
