@@ -36,7 +36,6 @@ def test_cdse_rs_wz_barrier(tmp_path, monkeypatch):
         n_probes=3, max_gen=10, patience=3,
         opt_steps=500, opt_fmax=0.005,
         saddle_steps=500, saddle_fmax=0.05,
-        bias_steps=40,
         fp_step_scale=0.5, fp_push_scale=0.1,
         ediff=0.01, dist_threshold=0.1,
     )

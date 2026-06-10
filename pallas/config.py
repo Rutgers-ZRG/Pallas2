@@ -18,19 +18,14 @@ class PallasConfig:
     press: float = 0.0                          # external pressure (eV/A^3)
     pressure_gpa: float = None                  # external pressure (GPa); converted to press
 
-    # PSO parameters
+    # Search step cap (run_fp_guided chain growing)
     maxstep: int = 50
-    popsize: int = 10
-    velocity_weight: float = 0.9
-    c1: float = 2.0     # personal best weight
-    c2: float = 1.5     # global best weight
 
     # Optimization step limits
     opt_steps: int = 2000           # max FIRE steps for local optimization
     opt_fmax: float = 0.001         # force convergence for optimization
     saddle_steps: int = 2000        # max FIRE steps for dimer saddle search
     saddle_fmax: float = 0.01       # force convergence for saddle
-    bias_steps: int = 60            # max FIRE steps for FP bias relaxation
 
     # FP-guided search parameters
     fp_step_scale: float = 0.05     # perturbation scale along FP gradient (small to stay near basin)
