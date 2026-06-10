@@ -6,7 +6,7 @@ from copy import deepcopy as cp
 import numpy as np
 
 from pallas.optimize import cal_saddle, local_optimization, vrand, vunit
-from pallas.structure import enthalpy, fp_distance
+from pallas.structure import enthalpy, fp_distance, spacegroup_label
 from pallas.xcal import XCalculator
 
 # ── Main PALLAS class ────────────────────────────────────────────────
@@ -160,7 +160,8 @@ class ProbeMixin:
                           cfg.press) - self.baseenergy)
         if sad_id not in self.G:
             self.G.add_node(sad_id, xname=f'S{sad_id}', e=h_sad,
-                            volume=saddle.get_volume())
+                            volume=saddle.get_volume(),
+                            spg=spacegroup_label(saddle)[0])
             self._save_to_traj(saddle, sad_id, 'saddle', h_sad)
         else:
             h_sad = self.G.nodes[sad_id]['e']  # use stored enthalpy
@@ -194,7 +195,8 @@ class ProbeMixin:
                           cfg.press) - self.baseenergy)
         if min_id not in self.G:
             self.G.add_node(min_id, xname=f'M{min_id}', e=h_min,
-                            volume=new_min.get_volume())
+                            volume=new_min.get_volume(),
+                            spg=spacegroup_label(new_min)[0])
             self._save_to_traj(new_min, min_id, 'minima', h_min)
         else:
             h_min = self.G.nodes[min_id]['e']  # use stored enthalpy

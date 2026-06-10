@@ -174,3 +174,32 @@ if __name__ == "__main__":
 
     barrier, path = minimax_barrier(G, 0, 2)
     print("Path :", path, "  barrier node energy  :", barrier)
+
+
+# ----------------------------------------------------------------------
+# 5.  k-best diverse pathways (bottleneck-edge removal)
+# ----------------------------------------------------------------------
+def k_best_paths(G, s, t, k=5, weight="weight"):
+    """Up to ``k`` minimax paths, diversified by bottleneck edge.
+
+    Iteratively: find the minimax path, record it, remove its bottleneck
+    edge (the max-weight edge on the path), repeat. Each successive path
+    must therefore avoid all previous bottlenecks; stops early once s and
+    t disconnect.
+
+    Returns
+    -------
+    list of (path, bottleneck) — best first.
+    """
+    H = G.copy()
+    out = []
+    for _ in range(k):
+        try:
+            path, bottleneck = minimax_path(H, s, t, weight)
+        except (nx.NetworkXNoPath, KeyError):
+            break
+        out.append((path, bottleneck))
+        bn_edge = max(zip(path[:-1], path[1:]),
+                      key=lambda e: H.edges[e][weight])
+        H.remove_edge(*bn_edge)
+    return out

@@ -11,10 +11,10 @@ from ase.io import read
 # ── Main PALLAS class ────────────────────────────────────────────────
 from pallas.analysis import AnalysisMixin
 from pallas.config import PallasConfig
-from pallas.graph import minimax_path_kinetic
+from pallas.graph import k_best_paths, minimax_path_kinetic
 from pallas.optimize import local_optimization
 from pallas.probes import ProbeMixin
-from pallas.structure import PallasAtom, enthalpy, fp_distance
+from pallas.structure import PallasAtom, enthalpy, fp_distance, spacegroup_label
 
 
 class Pallas(ProbeMixin, AnalysisMixin):
@@ -226,7 +226,8 @@ class Pallas(ProbeMixin, AnalysisMixin):
             h = (enthalpy(opt.get_potential_energy(), opt.get_volume(),
                           self.config.press) - self.baseenergy)
 
-        self.G.add_node(idm, xname=f'M{idm}', e=h, volume=opt.get_volume())
+        self.G.add_node(idm, xname=f'M{idm}', e=h, volume=opt.get_volume(),
+                        spg=spacegroup_label(opt)[0])
         self._save_to_traj(opt, idm, 'minima', h)
         print(f"Registered {'base' if is_base else 'target'}: "
               f"ID={idm}, H={h:.4f} eV")
@@ -626,7 +627,8 @@ class Pallas(ProbeMixin, AnalysisMixin):
                                     cfg.press) - self.baseenergy)
                     if mid not in self.G:
                         self.G.add_node(mid, xname=f'M{mid}', e=h_m,
-                                        volume=m.get_volume())
+                                        volume=m.get_volume(),
+                                        spg=spacegroup_label(m)[0])
                         self._save_to_traj(m, mid, 'minima', h_m)
                     else:
                         h_m = self.G.nodes[mid]['e']  # use stored enthalpy
@@ -1028,11 +1030,16 @@ class Pallas(ProbeMixin, AnalysisMixin):
         nx.write_gexf(self.G, 'graph.gexf')
         joblib.dump(self.dij, 'dij.pkl')
 
-    def find_best_path(self):
-        """Find kinetically optimal path between reactant and product.
+    def find_best_path(self, k=1):
+        """Find kinetically optimal path(s) between reactant and product.
 
         Uses directed minimax to minimize the rate-limiting local barrier
         (max of H_saddle − H_preceding_min over all steps).
+
+        Parameters
+        ----------
+        k : int — if > 1, also computes the k best bottleneck-diverse
+            pathways (stored in ``self.top_paths`` and printed).
 
         Returns
         -------
@@ -1041,5 +1048,13 @@ class Pallas(ProbeMixin, AnalysisMixin):
         """
         react_id = self.init_minima[0].id
         prod_id = self.init_minima[1].id
+        if k > 1:
+            self.top_paths = k_best_paths(self.G, react_id, prod_id, k=k)
+            print(f"Top-{len(self.top_paths)} diverse pathways (bottleneck-edge removal):")
+            for i, (pth, bn) in enumerate(self.top_paths, 1):
+                spgs = ' -> '.join(self.G.nodes[n].get('spg', '?')
+                                   for n in pth
+                                   if self.G.nodes[n].get('xname', '').startswith('M'))
+                print(f"  #{i}: barrier-bound {bn:.4f} eV | {spgs}")
         return minimax_path_kinetic(self.G, react_id, prod_id)
 

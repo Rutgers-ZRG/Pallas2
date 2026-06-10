@@ -34,8 +34,9 @@ class AnalysisMixin:
             for node in best_path:
                 nd = self.G.nodes[node]
                 ntype = 'MIN' if nd['xname'].startswith('M') else 'SAD'
+                spg = nd.get('spg', '?')
                 print(f"  {ntype} {node}: H={nd['e']:.4f} eV, "
-                      f"V={nd['volume']:.1f} A^3")
+                      f"V={nd['volume']:.1f} A^3, {spg}")
             self.analyze_pathway(best_path)
             self.get_pathway_trajectory(best_path)
         else:
