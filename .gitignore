@@ -1,4 +1,5 @@
-docs/
+docs/*
+!docs/benchmarks.md
 __pycache__/
 *.pyc
 *.log
