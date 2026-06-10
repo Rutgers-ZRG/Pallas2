@@ -7,6 +7,7 @@ mkdir -p runs
 run_one () {
   local sys=$1 press=$2 seed=$3
   local wd=runs/${sys}-s${seed}
+  rm -rf "$wd"   # stale pallas.db rows would pollute init_run
   echo "=== $sys seed=$seed P=${press} GPa ==="
   conda run -n reform pallas run \
     benchmarks/$sys/POSCAR_A benchmarks/$sys/POSCAR_B \
