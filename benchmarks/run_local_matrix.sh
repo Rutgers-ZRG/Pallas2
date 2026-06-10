@@ -10,11 +10,11 @@ run_one () {
   local wd=runs/${sys}-s${seed}
   rm -rf "$wd"   # stale pallas.db rows would pollute init_run
   echo "=== $sys seed=$seed P=${press} GPa ==="
-  conda run -n reform pallas run \
+  conda run --live-stream -n reform pallas run \
     benchmarks/$sys/POSCAR_A benchmarks/$sys/POSCAR_B \
     --calc mattersim --pressure "$press" --probes 5 --max-gen 15 \
     --patience 4 --seed "$seed" --natx 100 --n-workers 2 \
-    --workdir "$wd" 2>&1 | tail -2
+    --workdir "$wd" 2>&1 | grep -E 'Gen |barrier|Barrier|No path|Error|error|Registered'
   cp "$wd/summary.json" benchmarks/$sys/result_s${seed}.json 2>/dev/null || true
 }
 
