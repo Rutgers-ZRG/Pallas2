@@ -7,7 +7,6 @@ import joblib
 import networkx as nx
 import numpy as np
 from ase.io import read
-from ase.units import GPa
 
 # ── Main PALLAS class ────────────────────────────────────────────────
 from pallas.analysis import AnalysisMixin
@@ -15,7 +14,7 @@ from pallas.config import PallasConfig
 from pallas.graph import minimax_path_kinetic
 from pallas.optimize import local_optimization
 from pallas.probes import ProbeMixin
-from pallas.structure import PallasAtom, fp_distance
+from pallas.structure import PallasAtom, enthalpy, fp_distance
 
 
 class Pallas(ProbeMixin, AnalysisMixin):
@@ -214,17 +213,18 @@ class Pallas(ProbeMixin, AnalysisMixin):
     def _optimize_and_register(self, structure, is_base=False):
         """Optimize a structure and register it in the graph."""
         cfg = self.config
-        opt = local_optimization(structure, fmax=cfg.opt_fmax, steps=cfg.opt_steps)
+        opt = local_optimization(structure, fmax=cfg.opt_fmax, steps=cfg.opt_steps,
+                                 press=cfg.press)
         idm, _ = self._update_minima(opt)
         opt.id = idm
 
         if is_base:
-            self.baseenergy = (opt.get_volume() * self.config.press * GPa
-                               + opt.get_potential_energy())
+            self.baseenergy = enthalpy(opt.get_potential_energy(),
+                                       opt.get_volume(), self.config.press)
             h = 0.0
         else:
-            h = (opt.get_volume() * self.config.press * GPa
-                 + opt.get_potential_energy() - self.baseenergy)
+            h = (enthalpy(opt.get_potential_energy(), opt.get_volume(),
+                          self.config.press) - self.baseenergy)
 
         self.G.add_node(idm, xname=f'M{idm}', e=h, volume=opt.get_volume())
         self._save_to_traj(opt, idm, 'minima', h)
@@ -622,8 +622,8 @@ class Pallas(ProbeMixin, AnalysisMixin):
                         continue
                     mid, _ = self._update_minima(m)
                     m.id = mid
-                    h_m = (m.get_volume() * cfg.press * GPa
-                           + m.get_potential_energy() - self.baseenergy)
+                    h_m = (enthalpy(m.get_potential_energy(), m.get_volume(),
+                                    cfg.press) - self.baseenergy)
                     if mid not in self.G:
                         self.G.add_node(mid, xname=f'M{mid}', e=h_m,
                                         volume=m.get_volume())

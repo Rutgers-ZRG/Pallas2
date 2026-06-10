@@ -4,10 +4,9 @@
 from copy import deepcopy as cp
 
 import numpy as np
-from ase.units import GPa
 
 from pallas.optimize import cal_saddle, local_optimization, vrand, vunit
-from pallas.structure import fp_distance
+from pallas.structure import enthalpy, fp_distance
 from pallas.xcal import XCalculator
 
 # ── Main PALLAS class ────────────────────────────────────────────────
@@ -107,7 +106,7 @@ class ProbeMixin:
 
             cfg = self.config
             opt = local_optimization(atoms, fmax=cfg.opt_fmax,
-                                     steps=cfg.opt_steps)
+                                     steps=cfg.opt_steps, press=cfg.press)
             return opt
         except Exception:
             return None
@@ -157,8 +156,8 @@ class ProbeMixin:
         # Register saddle
         sad_id, _ = self._update_saddle(saddle)
         saddle.id = sad_id
-        h_sad = (saddle.get_volume() * cfg.press * GPa
-                 + saddle.get_potential_energy() - self.baseenergy)
+        h_sad = (enthalpy(saddle.get_potential_energy(), saddle.get_volume(),
+                          cfg.press) - self.baseenergy)
         if sad_id not in self.G:
             self.G.add_node(sad_id, xname=f'S{sad_id}', e=h_sad,
                             volume=saddle.get_volume())
@@ -186,13 +185,13 @@ class ProbeMixin:
         escaped = self._saddle_escape(saddle, target_fp)
         traj_frames.append(escaped.copy())  # escaped structure
         new_min = local_optimization(escaped, fmax=cfg.opt_fmax,
-                                     steps=cfg.opt_steps,
+                                     steps=cfg.opt_steps, press=cfg.press,
                                      traj_frames=traj_frames)
         min_id, _ = self._update_minima(new_min)
         new_min.id = min_id
 
-        h_min = (new_min.get_volume() * cfg.press * GPa
-                 + new_min.get_potential_energy() - self.baseenergy)
+        h_min = (enthalpy(new_min.get_potential_energy(), new_min.get_volume(),
+                          cfg.press) - self.baseenergy)
         if min_id not in self.G:
             self.G.add_node(min_id, xname=f'M{min_id}', e=h_min,
                             volume=new_min.get_volume())
@@ -328,7 +327,7 @@ class ProbeMixin:
 
             attempt_frames = [] if traj_frames is not None else None
             saddle = cal_saddle(cp(perturbed), fmax=cfg.saddle_fmax,
-                                steps=cfg.saddle_steps, mode=trial_mode,
+                                steps=cfg.saddle_steps, press=cfg.press, mode=trial_mode,
                                 traj_frames=attempt_frames)
             curv = getattr(saddle, 'dimer_curvature', None)
 

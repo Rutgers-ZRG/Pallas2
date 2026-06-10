@@ -55,13 +55,14 @@ def _get_calculator():
 # ── Structure optimization ────────────────────────────────────────────
 
 def local_optimization(patoms, fmax=0.001, steps=2000, calc=None,
-                       traj_frames=None):
+                       traj_frames=None, press=0.0):
     """Optimize structure (positions + cell) with MatterSim.
 
     Parameters
     ----------
     patoms : Atoms — input structure (modified in-place).
     fmax : float — force convergence threshold (eV/Å).
+    press : float — external pressure (eV/Å³); enters via scalar_pressure.
     steps : int — max optimizer steps.
     calc : Calculator, optional — override default MatterSim.
     traj_frames : list, optional — if provided, append snapshots every
@@ -73,7 +74,7 @@ def local_optimization(patoms, fmax=0.001, steps=2000, calc=None,
     """
     atoms = patoms
     atoms.calc = calc or _get_calculator()
-    ecf = FrechetCellFilter(atoms)
+    ecf = FrechetCellFilter(atoms, scalar_pressure=press)
 
     def _save_frame():
         if traj_frames is not None:
@@ -98,7 +99,7 @@ def local_optimization(patoms, fmax=0.001, steps=2000, calc=None,
 
 
 def cal_saddle(patoms, fmax=0.01, steps=2000, calc=None, mode=None,
-               optimizer='quickmin', traj_frames=None):
+               optimizer='quickmin', traj_frames=None, press=0.0):
     """Find saddle point using solid-state dimer method.
 
     Parameters
@@ -140,7 +141,8 @@ def cal_saddle(patoms, fmax=0.01, steps=2000, calc=None, mode=None,
         atoms.set_cell(cellt, scale_atoms=True)
         atoms.set_positions(atoms.get_positions() + mode[:-3])
 
-    d = SolidStateDimer(atoms, mode=mode, dimer_separation=0.01, max_rotations=8)
+    d = SolidStateDimer(atoms, mode=mode, dimer_separation=0.01, max_rotations=8,
+                        external_stress=np.eye(3) * press)
 
     if optimizer == 'quickmin':
         # TSASE-style: momentum-based, requires negative curvature
