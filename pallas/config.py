@@ -31,6 +31,7 @@ class PallasConfig:
     fp_step_scale: float = 0.05     # perturbation scale along FP gradient (small to stay near basin)
     fp_push_scale: float = 0.05     # post-saddle push scale toward target
     max_retries: int = 2            # retries with smaller step on saddle failure
+    max_saddle_rise: float = 20.0   # reject saddles more than this above the source (eV/cell)
 
     # Barrier refinement parameters
     refine_rounds: int = 3          # number of refinement iterations

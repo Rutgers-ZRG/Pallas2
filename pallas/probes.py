@@ -218,9 +218,18 @@ def probe_compute(current, target_fp, types, cfg, step_scale=None,
         from pallas.optimize import set_calculator
         set_calculator(calc)
 
-    fp_mode = fp_gradient_mode(current, target_fp, cfg)
+    try:
+        fp_mode = fp_gradient_mode(current, target_fp, cfg)
+    except Exception as e:
+        return {'ok': False, 'error': f'fp gradient failed: {e}',
+                'target_fp': target_fp}
     rand_mode = gen_random_mode(current)
     mode = vunit(alpha * fp_mode + (1.0 - alpha) * rand_mode)
+
+    try:
+        e_src = float(current.get_potential_energy())
+    except Exception:
+        e_src = None
 
     traj_frames = [current.copy()]
     saddle = None
@@ -229,8 +238,16 @@ def probe_compute(current, target_fp, types, cfg, step_scale=None,
         try:
             base = cfg.fp_step_scale if step_scale is None else step_scale
             scale = base * (0.5 ** attempt)
-            saddle = fp_guided_saddle(current, mode, scale, cfg,
-                                      traj_frames=traj_frames)
+            cand = fp_guided_saddle(current, mode, scale, cfg,
+                                    traj_frames=traj_frames)
+            e_cand = float(cand.get_potential_energy())
+            if not np.isfinite(e_cand):
+                raise ValueError('non-finite saddle energy (runaway PES)')
+            if e_src is not None and e_cand - e_src > cfg.max_saddle_rise:
+                raise ValueError(
+                    f'saddle {e_cand - e_src:.1f} eV above source '
+                    f'(> max_saddle_rise={cfg.max_saddle_rise}) — runaway dimer')
+            saddle = cand
             break
         except Exception as e:
             err = e
@@ -243,12 +260,18 @@ def probe_compute(current, target_fp, types, cfg, step_scale=None,
     e_sad = saddle.get_potential_energy()
     v_sad = saddle.get_volume()
 
-    escaped = saddle_escape(saddle, target_fp, cfg)
-    traj_frames.append(escaped.copy())
-    new_min = local_optimization(escaped, fmax=cfg.opt_fmax,
-                                 steps=cfg.opt_steps, press=cfg.press,
-                                 traj_frames=traj_frames)
-    e_min = new_min.get_potential_energy()
+    try:
+        escaped = saddle_escape(saddle, target_fp, cfg)
+        traj_frames.append(escaped.copy())
+        new_min = local_optimization(escaped, fmax=cfg.opt_fmax,
+                                     steps=cfg.opt_steps, press=cfg.press,
+                                     traj_frames=traj_frames)
+        e_min = float(new_min.get_potential_energy())
+        if not np.isfinite(e_min):
+            raise ValueError('non-finite minimum energy after escape')
+    except Exception as e:
+        return {'ok': False, 'error': f'escape/optimize failed: {e}',
+                'target_fp': target_fp}
     v_min = new_min.get_volume()
 
     for at, e in ((saddle, e_sad), (new_min, e_min)):

@@ -83,12 +83,17 @@ def local_optimization(patoms, fmax=0.001, steps=2000, calc=None,
     opt = FIRE(ecf, maxstep=0.1, logfile='opt.log')
     _save_frame()  # initial frame
     opt.attach(_save_frame, interval=10)
-    opt.run(fmax=fmax, steps=steps)
-
-    actual_fmax = np.max(np.abs(ecf.get_forces()))
-    atoms.converged = actual_fmax <= fmax
-    if not atoms.converged:
-        print(f"Warning: optimization did not converge (fmax={actual_fmax:.4f})")
+    try:
+        opt.run(fmax=fmax, steps=steps)
+        actual_fmax = np.max(np.abs(ecf.get_forces()))
+        e_check = atoms.get_potential_energy()
+        atoms.converged = bool(np.isfinite(actual_fmax) and np.isfinite(e_check)
+                               and actual_fmax <= fmax)
+        if not atoms.converged:
+            print(f"Warning: optimization did not converge (fmax={actual_fmax:.4f})")
+    except Exception as exc:  # NaN PES -> logm/eigh failures must not kill the run
+        print(f"Warning: optimization aborted ({type(exc).__name__}: {exc})")
+        atoms.converged = False
 
     new_cell = lower_triangular_cell(atoms)
     atoms.set_cell(new_cell, scale_atoms=True)
