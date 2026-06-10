@@ -1,9 +1,7 @@
 import sys
-import ase.db
-import numpy as np
-from ase import Atoms
-from ase.io import read, write
 
+import ase.db
+from ase.io import write
 
 
 def main():

@@ -8,12 +8,11 @@ Replaces the old libfp + mpi4py implementation with pure PyTorch autograd.
 """
 
 import numpy as np
-from ase.atoms import Atoms
-from ase.calculators.calculator import Calculator, all_changes, CalculatorSetupError
-from scipy.optimize import linear_sum_assignment
-
 import torch
 import torch_fplib
+from ase.atoms import Atoms
+from ase.calculators.calculator import Calculator, CalculatorSetupError, all_changes
+from scipy.optimize import linear_sum_assignment
 
 # Voigt index mapping: (row, col) for xx, yy, zz, yz, xz, xy
 _VOIGT_IDX = [(0, 0), (1, 1), (2, 2), (1, 2), (0, 2), (0, 1)]

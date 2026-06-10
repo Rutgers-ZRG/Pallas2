@@ -54,7 +54,7 @@ from pallas import Pallas, PallasConfig
 # Configure
 config = PallasConfig(
     znucl=[6],          # carbon
-    press=10.0,         # external pressure in eV/A^3
+    pressure_gpa=10.0,  # external pressure in GPa
     n_probes=5,         # probes per generation
     max_gen=50,         # max generations
     patience=5,         # stop after N gens without improvement

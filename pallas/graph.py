@@ -1,6 +1,7 @@
 # minimax_path.py
-from collections import deque
 import heapq
+from collections import deque
+
 import networkx as nx
 
 
