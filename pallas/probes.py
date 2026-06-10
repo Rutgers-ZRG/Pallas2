@@ -214,9 +214,11 @@ def probe_compute(current, target_fp, types, cfg, step_scale=None,
     if seed is not None:
         _random.seed(seed)
         np.random.seed(seed)
-    if calc is not None:
-        from pallas.optimize import set_calculator
-        set_calculator(calc)
+    from pallas.optimize import GeometryGuard, _get_calculator, set_calculator
+    base = calc if calc is not None else _get_calculator()
+    if not isinstance(base, GeometryGuard):
+        base = GeometryGuard(base)
+    set_calculator(base)
 
     try:
         fp_mode = fp_gradient_mode(current, target_fp, cfg)

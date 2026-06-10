@@ -9,6 +9,7 @@ from copy import deepcopy as cp
 
 import numpy as np
 from ase.filters import FrechetCellFilter
+from ase.calculators.calculator import Calculator, all_changes
 from ase.optimize import FIRE
 
 from pallas.dimer import SolidStateDimer
@@ -50,6 +51,61 @@ def _get_calculator():
         from mattersim.forcefield import MatterSimCalculator
         _calc = MatterSimCalculator(device="cpu")
     return _calc
+
+
+
+
+class GeometryError(ValueError):
+    """Structure is too degenerate to evaluate (guard refusal)."""
+
+
+class GeometryGuard(Calculator):
+    """Calculator wrapper that refuses pathological structures instantly.
+
+    Collapsed cells and fused atoms make MLIP neighbor lists explode
+    (30-80 s per force call observed); evaluating them is never useful to
+    PALLAS. Raising GeometryError lets the probe retry/fail machinery
+    handle it in milliseconds instead.
+    """
+
+    implemented_properties = ['energy', 'forces', 'stress']
+
+    def __init__(self, calc, min_height=0.9, min_dist=0.5, **kwargs):
+        super().__init__(**kwargs)
+        self.inner = calc
+        self.min_height = float(min_height)
+        self.min_dist = float(min_dist)
+
+    def _check(self, atoms):
+        cell = atoms.get_cell()[:]
+        vol = abs(np.linalg.det(cell))
+        if vol < 1e-6:
+            raise GeometryError('cell volume ~ 0')
+        for i in range(3):
+            area = np.linalg.norm(np.cross(cell[(i + 1) % 3], cell[(i + 2) % 3]))
+            if vol / max(area, 1e-12) < self.min_height:
+                raise GeometryError(
+                    f'cell height {vol / area:.2f} A < {self.min_height} A '
+                    f'(collapsed cell)')
+        if len(atoms) > 1:
+            from ase.geometry import get_distances
+            _, dmat = get_distances(atoms.positions, cell=atoms.cell,
+                                    pbc=atoms.pbc)
+            dmin = dmat[~np.eye(len(atoms), dtype=bool)].min()
+            if dmin < self.min_dist:
+                raise GeometryError(f'min interatomic distance {dmin:.2f} A '
+                                    f'< {self.min_dist} A (fused atoms)')
+
+    def calculate(self, atoms=None, properties=None,
+                  system_changes=tuple(all_changes)):
+        if properties is None:
+            properties = self.implemented_properties
+        super().calculate(atoms, properties, system_changes)
+        self._check(self.atoms)
+        e = self.inner.get_potential_energy(self.atoms)
+        f = self.inner.get_forces(self.atoms)
+        st = self.inner.get_stress(self.atoms)
+        self.results = {'energy': e, 'forces': f, 'stress': st}
 
 
 # ── Structure optimization ────────────────────────────────────────────
