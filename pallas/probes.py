@@ -243,6 +243,11 @@ def probe_compute(current, target_fp, types, cfg, step_scale=None,
             e_cand = float(cand.get_potential_energy())
             if not np.isfinite(e_cand):
                 raise ValueError('non-finite saddle energy (runaway PES)')
+            v_ratio = cand.get_volume() / max(current.get_volume(), 1e-9)
+            if not 0.3 <= v_ratio <= 3.0:
+                raise ValueError(
+                    f'saddle cell volume ratio {v_ratio:.2f} outside [0.3, 3] '
+                    f'— collapsed/exploded cell')
             if e_src is not None and e_cand - e_src > cfg.max_saddle_rise:
                 raise ValueError(
                     f'saddle {e_cand - e_src:.1f} eV above source '
@@ -269,6 +274,10 @@ def probe_compute(current, target_fp, types, cfg, step_scale=None,
         e_min = float(new_min.get_potential_energy())
         if not np.isfinite(e_min):
             raise ValueError('non-finite minimum energy after escape')
+        v_ratio = new_min.get_volume() / max(current.get_volume(), 1e-9)
+        if not 0.3 <= v_ratio <= 3.0:
+            raise ValueError(
+                f'minimum cell volume ratio {v_ratio:.2f} outside [0.3, 3]')
     except Exception as e:
         return {'ok': False, 'error': f'escape/optimize failed: {e}',
                 'target_fp': target_fp}

@@ -3,6 +3,7 @@
 set -uo pipefail
 cd /Users/li/dev/Pallas2
 mkdir -p runs
+export OMP_NUM_THREADS=2 MKL_NUM_THREADS=2
 
 run_one () {
   local sys=$1 press=$2 seed=$3
@@ -11,8 +12,8 @@ run_one () {
   echo "=== $sys seed=$seed P=${press} GPa ==="
   conda run -n reform pallas run \
     benchmarks/$sys/POSCAR_A benchmarks/$sys/POSCAR_B \
-    --calc mattersim --pressure "$press" --probes 5 --max-gen 30 \
-    --patience 5 --seed "$seed" --natx 100 --n-workers 4 \
+    --calc mattersim --pressure "$press" --probes 5 --max-gen 15 \
+    --patience 4 --seed "$seed" --natx 100 --n-workers 2 \
     --workdir "$wd" 2>&1 | tail -2
   cp "$wd/summary.json" benchmarks/$sys/result_s${seed}.json 2>/dev/null || true
 }
