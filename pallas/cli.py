@@ -83,6 +83,19 @@ def cmd_run(args):
     pallas = Pallas(config)
     pallas.init_run([a_path, b_path])
     path, barrier = pallas.run()
+
+    validation = None
+    refinement = None
+    if path and args.validate:
+        validation = pallas.validate_graph()
+        try:
+            path, barrier = pallas.find_best_path()
+        except Exception:
+            path, barrier = None, float('inf')
+    if path and args.refine_fmax > 0:
+        refinement = pallas.refine_path_saddles(path=path,
+                                                fmax=args.refine_fmax)
+        path, barrier = pallas.find_best_path()
     if path and args.k_paths > 1:
         pallas.find_best_path(k=args.k_paths)
 
@@ -102,6 +115,8 @@ def cmd_run(args):
                          if d.get('xname', '').startswith('S')),
         'runtime_s': round(time.time() - t0, 1),
         'commit': _commit_id(),
+        'validation': validation,
+        'refinement': refinement,
     }
     with open('summary.json', 'w') as f:
         json.dump(summary, f, indent=1)
@@ -167,6 +182,11 @@ def main(argv=None):
     pr.add_argument('--probe-alloc', default='adaptive',
                     choices=['adaptive', 'round_robin'])
     pr.add_argument('--k-paths', type=int, default=1)
+    pr.add_argument('--validate', default=True,
+                    action=argparse.BooleanOptionalAction,
+                    help='validate saddle connectivity before reporting')
+    pr.add_argument('--refine-fmax', type=float, default=0.01,
+                    help='tight fmax for bottleneck-saddle refinement (0 = off)')
     pr.add_argument('--workdir', default='.')
     pr.set_defaults(func=cmd_run)
 

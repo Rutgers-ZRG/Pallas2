@@ -1123,6 +1123,94 @@ class Pallas(ProbeMixin, AnalysisMixin):
         nx.write_gexf(self.G, 'graph.gexf')
         joblib.dump(self.dij, 'dij.pkl')
 
+    def refine_path_saddles(self, path=None, fmax=0.01, steps=800,
+                            max_drift=0.05):
+        """Tightly re-converge the saddles on a path and update the graph.
+
+        Production searches use a loose ``saddle_fmax`` (speed); barriers
+        quoted from them carry an O(0.05-0.2 eV) bias. This pass restarts
+        the dimer AT each stored saddle with its STORED mode (no random
+        re-initialization) at tight ``fmax``, and accepts the refined
+        energy only if the dimer stays on the same saddle
+        (FP drift < ``max_drift``) with negative curvature — otherwise the
+        original energy is kept and the saddle is flagged.
+
+        Returns a list of dicts: saddle, accepted, dH, dfp, curvature.
+        """
+        from pallas.optimize import cal_saddle
+        from pallas.structure import enthalpy
+
+        if path is None:
+            path, _ = minimax_path_kinetic(
+                self.G, self.init_minima[0].id, self.init_minima[1].id)
+        cfg = self.config
+        types = None
+        report = []
+        for n in path:
+            if not self.G.nodes[n].get('xname', '').startswith('S'):
+                continue
+            entry = {'saddle': self.G.nodes[n]['xname'], 'accepted': False,
+                     'dH': 0.0, 'dfp': None, 'curvature': None,
+                     'reason': ''}
+            try:
+                row = self.db.get(id=n)
+                sad = PallasAtom(self.db.get_atoms(n))
+                sad.znucl = cfg.znucl
+                sad.natx = cfg.natx
+                sad.fpcutoff = cfg.fpcutoff
+                sad.fp = np.array(row.data['fp'])
+                mode = row.data.get('dimer_mode')
+            except Exception as exc:
+                entry['reason'] = f'load failed: {exc}'
+                report.append(entry)
+                continue
+            if types is None:
+                types = self._get_types(sad)
+            if mode is None:
+                entry['reason'] = 'no stored dimer mode'
+                report.append(entry)
+                continue
+
+            e0 = float(row.data['energy'])
+            v0 = sad.get_volume()
+            try:
+                re = cal_saddle(sad, fmax=fmax, steps=steps,
+                                mode=np.array(mode), press=cfg.press)
+                e1 = float(re.get_potential_energy())
+                v1 = re.get_volume()
+            except Exception as exc:
+                entry['reason'] = f'refine dimer failed: {exc}'
+                report.append(entry)
+                continue
+
+            rp = PallasAtom(re)
+            rp.znucl, rp.natx, rp.fpcutoff = cfg.znucl, cfg.natx, cfg.fpcutoff
+            dfp = fp_distance(rp.get_fp(), sad.fp, types)
+            curv = getattr(re, 'dimer_curvature', None)
+            entry['dfp'] = float(dfp)
+            entry['curvature'] = (float(curv) if curv is not None else None)
+
+            if not getattr(re, 'converged', False):
+                entry['reason'] = 'refine dimer not converged'
+            elif curv is None or curv >= 0:
+                entry['reason'] = 'non-negative curvature'
+            elif dfp > max_drift:
+                entry['reason'] = f'drifted (dfp={dfp:.4f} > {max_drift})'
+            else:
+                dH = (enthalpy(e1, v1, cfg.press)
+                      - enthalpy(e0, v0, cfg.press))
+                self.G.nodes[n]['e'] += dH
+                for nb in self.G.neighbors(n):
+                    self.G.edges[n, nb]['weight'] = max(
+                        self.G.nodes[n]['e'], self.G.nodes[nb]['e'])
+                entry['dH'] = float(dH)
+                entry['accepted'] = True
+            print(f"  refine {entry['saddle']}: accepted={entry['accepted']} "
+                  f"dH={entry['dH']:+.4f} dfp={entry['dfp']:.4f} "
+                  f"k={entry['curvature']} {entry['reason']}")
+            report.append(entry)
+        return report
+
     def find_best_path(self, k=1):
         """Find kinetically optimal path(s) between reactant and product.
 

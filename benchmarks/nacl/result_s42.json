@@ -1,0 +1,27 @@
+{
+ "barrier_ev": 0.8938712290818565,
+ "path": [
+  1,
+  3,
+  2
+ ],
+ "path_names": [
+  "M1",
+  "S3",
+  "M2"
+ ],
+ "path_enthalpies_ev": [
+  0.0,
+  0.8938712290818565,
+  -0.29657326975339515
+ ],
+ "spacegroups": [
+  "Fm-3m",
+  "P1",
+  "Pm-3m"
+ ],
+ "n_minima": 7,
+ "n_saddles": 18,
+ "runtime_s": 477.3,
+ "commit": "v1.0.0-rc1-3-g9baf3db"
+}
