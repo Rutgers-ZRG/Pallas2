@@ -5,7 +5,7 @@ PALLAS barrier = kinetic-minimax bottleneck (max local barrier H_saddle − H_pr
 G-SSNEB baseline: TSASE climbing-image solid-state NEB, 9 images, same endpoints /
 calculator / pressure; barrier = max-image enthalpy − first-image enthalpy.
 
-**Status: IN PROGRESS — table updated as runs land.**
+**Status: complete except Si budget iteration (running).**
 
 ## Headline table
 
@@ -15,8 +15,8 @@ calculator / pressure; barrier = max-image enthalpy − first-image enthalpy.
 | CdSe RS→WZ (8 at) | 0 | NequIP dual | **0.0011 eV (0.0006 eV/f.u.)**, 8.5 min | — (pending decision) | Confirms barrierless-path finding on the harder MLIP PES (drag-init variant had given 0.104) |
 | C graphite→HD (16 at) | **0 (effective)** | Allegro r2SCAN | **4.470 eV (0.279 eV/atom)**, 86.9 min, job 5754901 | — | No-drag ≤ drag (4.483): settles the drag question on carbon. NOTE: pre-fix "15 GPa" runs were effectively P≈0 (see pressure-bug note) |
 | C graphite→HD (16 at) | **15 (true)** | Allegro r2SCAN | **2.492 eV (0.156 eV/atom)** best of 3 seeds (2.49/2.95/2.95); best path = 2-step via layer-shifted intermediate (+0.51 eV, V=123 Å³) | **FAILS: 28.2 eV** (1.76 eV/atom), 14,383 calls, 945 s (job 5755060) | PALLAS 9.6× lower. Linear interpolation across the c-axis collapse (26.8→16.5 Å) drives atoms through each other — same failure class as NaCl. Path: gra (120.8 Å³) → S (109.9 Å³) → HD (87.1 Å³); reverse 5.16 eV; HD −2.21 eV below gra ✓ |
-| Si diamond→β-tin (8 at) | 12 | MatterSim | seed matrix running | **1.113 eV (0.139 eV/atom)**, 21,002 calls | MatterSim ΔH gate: β-tin favorable ≥ ~8–12 GPa ✓ literature |
-| NaCl B1→B2 (8 at) | 30 | MatterSim | seed matrix running | **FAILS: 21→75 eV**, diverges with more iterations | Linear-interpolation catastrophe (atoms collide between incommensurate B1/B2 mappings) — a known NEB failure mode PALLAS avoids by construction (no interpolation) |
+| Si diamond→β-tin (8 at) | 12 | MatterSim | 1.267 eV (0.158 eV/atom) — identical across 3 seeds (same saddle); budget iteration pending | **1.113 eV (0.139 eV/atom)**, 21,002 calls | The one NEB-friendly case (near-linear tetragonal compression path). PALLAS robustly finds a 1.267 eV mechanism; gap 0.154 eV under investigation (see leading-performance notes) |
+| NaCl B1→B2 (8 at) | 30 | MatterSim | **0.1405 eV (0.0351 eV/f.u.)** best of 3 (0.14/0.74/0.89), 13.4 min; best path = Fm-3m → **P2₁/m intermediate** → Pm-3m (Buerger-type, auto-discovered + auto-labeled) | **FAILS: 21→75 eV**, diverges with iterations | Decisive: linear interpolation collides atoms between incommensurate B1/B2 mappings; PALLAS needs no interpolation and finds the literature monoclinic mechanism |
 
 ## Reference anchors
 
