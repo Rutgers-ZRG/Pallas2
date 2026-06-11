@@ -31,9 +31,10 @@ def make_calc(spec):
         return MatterSimCalculator(device='cpu')
     if spec == 'nequip-cdse':
         from pallas.nequip_calc import NequIPDualCalc
+        root = '/Users/li/dev/Pallas2'
         return NequIPDualCalc(
-            ef_model_path='tests/cdse/model/cdse_energy_force_model.pth',
-            stress_model_path='tests/cdse/model/cdse_stress_model.pth')
+            ef_model_path=root + '/tests/cdse/model/cdse_energy_force_model.pth',
+            stress_model_path=root + '/tests/cdse/model/cdse_stress_model.pth')
     if spec == 'allegro-carbon':
         from nequip.ase import NequIPCalculator
         path = (os.environ.get('ALLEGRO_MODEL')
