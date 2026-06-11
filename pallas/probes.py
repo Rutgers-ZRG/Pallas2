@@ -350,29 +350,37 @@ class ProbeMixin:
         natom = len(saddle)
         vol = saddle.get_volume()
         jacob = (vol / natom) ** (1.0 / 3.0) * natom ** 0.5
-        push = cfg.fp_push_scale * 3.0  # same scale as _saddle_escape
+        base_push = cfg.fp_push_scale * 3.0  # same scale as _saddle_escape
 
-        min_plus = self._push_and_relax(saddle, mode, push, jacob)
-        min_minus = self._push_and_relax(saddle, -mode, push, jacob)
+        # Sharp ridges (large |curvature|) may need a larger displacement to
+        # commit to a basin: escalate the push until the two sides separate.
+        last_reason = ''
+        for mult in (1.0, 2.0, 4.0):
+            push = base_push * mult
+            min_plus = self._push_and_relax(saddle, mode, push, jacob)
+            min_minus = self._push_and_relax(saddle, -mode, push, jacob)
 
-        result['min_plus'] = min_plus
-        result['min_minus'] = min_minus
+            result['min_plus'] = min_plus
+            result['min_minus'] = min_minus
 
-        if min_plus is None or min_minus is None:
-            result['reason'] = 'relaxation failed'
+            if min_plus is None or min_minus is None:
+                last_reason = 'relaxation failed'
+                continue
+
+            d = fp_distance(min_plus.get_fp(), min_minus.get_fp(), types)
+            ediff = abs(min_plus.get_potential_energy()
+                        - min_minus.get_potential_energy())
+
+            if d < cfg.dist_threshold and ediff < cfg.ediff:
+                last_reason = (f'same minimum on both sides '
+                               f'(d={d:.5f}, dE={ediff:.5f}, push={push:.2f})')
+                continue
+
+            result['valid'] = True
+            break
+        else:
+            result['reason'] = last_reason
             return result
-
-        # Check the two minima are distinct
-        d = fp_distance(min_plus.get_fp(), min_minus.get_fp(), types)
-        ediff = abs(min_plus.get_potential_energy()
-                    - min_minus.get_potential_energy())
-
-        if d < cfg.dist_threshold and ediff < cfg.ediff:
-            result['reason'] = (f'same minimum on both sides '
-                                f'(d={d:.5f}, dE={ediff:.5f})')
-            return result
-
-        result['valid'] = True
         return result
 
     def _push_and_relax(self, saddle, mode, push_scale, jacob):

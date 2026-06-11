@@ -30,7 +30,7 @@ def test_cli_run_emt_end_to_end(emt_pair):
 
     summary = json.loads((wd / 'summary.json').read_text())
     for key in ('barrier_ev', 'path', 'spacegroups', 'n_minima', 'n_saddles',
-                'runtime_s', 'commit'):
+                'runtime_s', 'commit', 'validation', 'refinement'):
         assert key in summary
     assert (wd / 'config.json').exists()
 
