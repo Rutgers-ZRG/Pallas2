@@ -70,15 +70,6 @@ class Pallas(ProbeMixin, AnalysisMixin):
         self.G = nx.Graph()
         self.db = None
 
-        # PSO state
-        self.pbestx = []
-        self.pbesty = []
-        self.gbestx = None
-        self.gbesty = None
-        self.pdistx = []
-        self.pdisty = []
-        self.bestdist = float('inf')
-
     # ── Distance matrix (sparse dict) ────────────────────────────────
 
     def update_dij(self, id1, id2, fp_dist):
@@ -307,8 +298,6 @@ class Pallas(ProbeMixin, AnalysisMixin):
         # Final report
         self._report_result(best_path, best_barrier, A, known)
         return best_path, best_barrier
-
-    # ── PSO core ─────────────────────────────────────────────────────
 
     def _optimize_and_register(self, structure, is_base=False):
         """Optimize a structure and register it in the graph."""
