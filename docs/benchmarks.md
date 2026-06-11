@@ -79,3 +79,24 @@ matching the path's flanking minima. Tool: `benchmarks/audit_saddles.py`
 3. Production `saddle_fmax=0.05` ⇒ 0.03–0.2 eV barrier bias; refine bottleneck saddles at fmax≤0.01 before quoting.
 4. Multi-step paths need validation-in-the-loop: NaCl s44's spurious low-barrier intermediate route survived to the final answer because saddle connectivity was never re-checked.
 5. Connectivity push should scale with ridge sharpness (|κ|) — fixed fp_push_scale·3 fails on stiff carbon saddles.
+
+## FINAL validated numbers (2026-06-11, post v1.0.1 validation machinery)
+
+The first audit (above) itself carried two methodological artifacts, now fixed
+in v1.0.1 and corrected here:
+- its re-dimer used random-restart (mode=None perturbs before climbing) and
+  drifted up-ridge -> phantom +0.03/-0.04 eV "corrections";
+- its ±mode connectivity push was a fixed scale -> falsely rejected saddles
+  whose basins need a larger displacement to separate (NaCl s44; carbon
+  inconclusive).
+v1.0.1: escalating push (x1/x2/x4) in _validate_saddle; stored-mode tight
+refinement (refine_path_saddles, guarded acceptance); CLI runs both by
+default. `benchmarks/revalidate.py` applies the same pass to saved runs.
+
+| System | Validated barrier | Validation detail |
+|---|---|---|
+| CdSe MatterSim | **0.0260 eV (0.0065 eV/f.u.)** | S3+S6 refine in place (dH ≤ 0.0007, κ=−0.58/−0.41); 3 of 6 graph saddles pruned; morning's "0.055" was random-restart drift |
+| CdSe NequIP | **0.0282 eV (0.0071 eV/f.u.)** | re-path after validation: M1→S3→M2, S3 refined in place (κ=−0.27); raw 0.0011 route did not survive |
+| Si @12 GPa | **1.2675 eV (0.158 eV/atom)** | S3 (Imma) refines in place (+0.0003 eV, κ=−1.51); morning's "1.2335" was restart drift. NEB's 1.113 remains a non-stationary estimate |
+| NaCl @30 GPa | **0.1018 eV (0.0255 eV/f.u.)** | escalating push VALIDATES the low route (morning rejection = fixed-push artifact): s44 M1→S19→M2 direct, refined in place (κ=−0.23); s43 independently gives 0.1419 via S4. Literature-scale collective mechanism, NEB diverges |
+| C @15 GPa | revalidation queued (job 5755331) | escalating-push + stored-mode pass pending GPU queue |
