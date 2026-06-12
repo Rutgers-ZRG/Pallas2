@@ -367,9 +367,13 @@ class ProbeMixin:
                 last_reason = 'relaxation failed'
                 continue
 
-            d = fp_distance(min_plus.get_fp(), min_minus.get_fp(), types)
-            ediff = abs(min_plus.get_potential_energy()
-                        - min_minus.get_potential_energy())
+            try:
+                d = fp_distance(min_plus.get_fp(), min_minus.get_fp(), types)
+                ediff = abs(min_plus.get_potential_energy()
+                            - min_minus.get_potential_energy())
+            except Exception as exc:  # e.g. GeometryError on a degenerate basin
+                last_reason = f'side evaluation failed: {exc}'
+                continue
 
             if d < cfg.dist_threshold and ediff < cfg.ediff:
                 last_reason = (f'same minimum on both sides '

@@ -62,3 +62,24 @@ def test_validate_saddle_escalates_push(monkeypatch):
     # escalation happened: more than one push magnitude tried
     assert len(set(pushes)) >= 2, f"no escalation: pushes={pushes}"
     assert max(pushes) > min(pushes) * 1.5
+
+
+def test_validate_saddle_survives_side_evaluation_error(monkeypatch):
+    """A pathological pushed structure (GeometryError on energy read) must
+    fail that escalation round, not crash validate_graph."""
+    from pallas.optimize import GeometryError
+
+    p = Pallas(PallasConfig(znucl=[29], natx=30))
+    saddle = _fake_saddle()
+
+    class Boom:
+        def get_fp(self):
+            raise GeometryError('degenerate basin')
+
+        def get_potential_energy(self):
+            raise GeometryError('degenerate basin')
+
+    monkeypatch.setattr(p, '_push_and_relax', lambda *a: Boom())
+    result = p._validate_saddle(saddle, types=np.array([1, 1]))
+    assert result['valid'] is False
+    assert 'failed' in result['reason']
