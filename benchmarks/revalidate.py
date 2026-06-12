@@ -51,6 +51,9 @@ def main():
     ap.add_argument('workdir')
     ap.add_argument('--calc', required=True)
     ap.add_argument('--refine-fmax', type=float, default=0.01)
+    ap.add_argument('--path-only', action='store_true',
+                    help='validate only the saddles on the current best path '
+                         '(full-graph validation can be expensive)')
     args = ap.parse_args()
 
     os.chdir(args.workdir)
@@ -86,7 +89,32 @@ def main():
     print(f"before: bottleneck {bn0:.4f} | "
           f"{' -> '.join(p.G.nodes[n]['xname'] for n in path0)}")
 
-    vstats = p.validate_graph()
+    if args.path_only:
+        vstats = {'total': 0, 'valid': 0, 'invalid': 0, 'pruned': 0}
+        for n in list(path0):
+            if not p.G.nodes[n].get('xname', '').startswith('S'):
+                continue
+            row = p.db.get(id=n)
+            sad = PallasAtom(p.db.get_atoms(n))
+            sad.znucl, sad.natx, sad.fpcutoff = cfg.znucl, cfg.natx, cfg.fpcutoff
+            sad.fp = np.array(row.data['fp'])
+            sad.id = n
+            mode = row.data.get('dimer_mode')
+            sad.dimer_mode = np.array(mode) if mode is not None else None
+            sad.dimer_curvature = row.data.get('curvature')
+            types = p._get_types(sad)
+            vstats['total'] += 1
+            res = p._validate_saddle(sad, types)
+            print(f"  {p.G.nodes[n]['xname']}: valid={res['valid']} "
+                  f"k={res['curvature']} {res['reason']}")
+            if res['valid']:
+                vstats['valid'] += 1
+            else:
+                vstats['invalid'] += 1
+                vstats['pruned'] += 1
+                p.G.remove_node(n)
+    else:
+        vstats = p.validate_graph()
     try:
         path1, bn1 = minimax_path_kinetic(p.G, 1, 2)
     except Exception:
