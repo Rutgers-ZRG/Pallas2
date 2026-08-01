@@ -4,6 +4,18 @@ from dataclasses import dataclass, field
 
 from ase.units import GPa
 
+# Self-audit guards (D6/D7, 2026-08-01 zero-barrier lessons).
+# A candidate saddle whose fingerprint AND energy match a known MINIMUM is
+# that minimum, not a saddle. Run dist_threshold can be coarse (0.1 on
+# CdSe) — the identity test is capped at a tight absolute scale so real
+# saddles near minima are not over-pruned.
+SADDLE_MIN_IDENTITY_DFP = 5e-3
+SADDLE_MIN_IDENTITY_EDIFF = 5e-3   # eV
+# Refinement may lower a saddle below a flanking minimum; such an edge is
+# no longer a valid adjacency (kinetic minimax would read it as barrier 0).
+# Sub-tolerance violations are noise-flat connections and are kept.
+EDGE_INVARIANT_TOL = 1e-3          # eV
+
 
 @dataclass
 class PallasConfig:

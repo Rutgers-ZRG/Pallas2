@@ -5,6 +5,7 @@ from copy import deepcopy as cp
 
 import numpy as np
 
+from pallas.config import SADDLE_MIN_IDENTITY_DFP, SADDLE_MIN_IDENTITY_EDIFF
 from pallas.optimize import cal_saddle, local_optimization, vrand, vunit
 from pallas.structure import enthalpy, fp_distance, spacegroup_label
 from pallas.xcal import XCalculator
@@ -340,6 +341,30 @@ class ProbeMixin:
         curvature = getattr(saddle, 'dimer_curvature', None)
         result['curvature'] = curvature
 
+        # D7 guard: a "saddle" identical to a known minimum is invalid
+        # outright (coarse run thresholds can't be trusted for identity —
+        # capped at the tight absolute scale)
+        if self.db is not None:
+            sid = getattr(saddle, 'id', None)
+            hs = None
+            if sid is not None:
+                try:
+                    # enthalpy comparison — raw E shifts by P·dV at pressure
+                    hs = (self.db.get(id=sid).data['energy']
+                          + cfg.press * saddle.get_volume())
+                except Exception:
+                    hs = None
+            dfp_id = min(cfg.dist_threshold, SADDLE_MIN_IDENTITY_DFP)
+            de_id = min(cfg.ediff, SADDLE_MIN_IDENTITY_EDIFF)
+            for x in self.db.select(ctyp='minima'):
+                d = fp_distance(saddle.get_fp(), np.array(x.data['fp']),
+                                types)
+                hx = x.data['energy'] + cfg.press * x.volume
+                if d < dfp_id and (hs is None or abs(hs - hx) < de_id):
+                    result['reason'] = (f'identical to minimum M{x.id} '
+                                        f'(d={d:.5f}) — not a saddle')
+                    return result
+
         # Primary check: connectivity (push ±mode, relax, verify distinct minima)
         dimer_mode = getattr(saddle, 'dimer_mode', None)
         if dimer_mode is None:
@@ -439,6 +464,21 @@ class ProbeMixin:
         traj_frames = result['traj_frames']
 
         sad_id, _ = self._update_saddle(saddle)
+        if sad_id is None:
+            # D7: fake saddle (identical to a known minimum) — keep the
+            # discovered endpoint minimum, skip the saddle and its edges
+            print(f"  [{side}] saddle rejected as minimum-duplicate; "
+                  f"registering the discovered minimum only")
+            min_id, _ = self._update_minima(new_min)
+            new_min.id = min_id
+            h_min = (enthalpy(result['e_min'], result['v_min'], cfg.press)
+                     - self.baseenergy)
+            if min_id not in self.G:
+                self.G.add_node(min_id, xname=f'M{min_id}', e=h_min,
+                                volume=result['v_min'],
+                                spg=spacegroup_label(new_min)[0])
+                self._save_to_traj(new_min, min_id, 'minima', h_min)
+            return new_min
         saddle.id = sad_id
         h_sad = (enthalpy(result['e_sad'], result['v_sad'], cfg.press)
                  - self.baseenergy)

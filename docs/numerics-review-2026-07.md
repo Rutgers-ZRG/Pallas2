@@ -123,7 +123,15 @@ refine-bottleneck→re-path to a fixed point (scratch
 `refine_until_stable.py`); consider folding that loop into the CLI/
 revalidate flow once D5 is fixed.
 
-## D6 — refinement can break the edge invariant H_sad ≥ H_min (found 2026-08-01, OPEN)
+## D6 — refinement can break the edge invariant H_sad ≥ H_min — **FIXED (2026-08-01)**
+
+**Status: fixed.** `_enforce_edge_invariant` (tol 1 meV) runs after every
+accepted refinement and as a sweep at the end of `validate_graph`; prunes
+are reported in the refine report and validation stats. Self-heal demo:
+re-running revalidate on the corrupted CdSe-NequIP D1 workdir auto-pruned
+M1—S16 and re-pathed+refined to 0.0309 eV with no manual intervention.
+
+### Original finding
 
 `_register_probe` refuses edges with H_sad ≤ H_min at registration, but
 `refine_path_saddles` can later LOWER a saddle below a flanking minimum and
@@ -134,7 +142,19 @@ local barrier as 0 (observed: CdSe-NequIP D1, S16 refined −17.7 meV to
 edges violating H_sad ≥ H_min − 1 meV and re-extract. Post-hoc scan:
 `benchmarks/screen_path_saddles.py`.
 
-## D7 — cross-type dedup hole: a "saddle" can be a known minimum (found 2026-08-01, OPEN)
+## D7 — cross-type dedup hole: a "saddle" can be a known minimum — **FIXED (2026-08-01)**
+
+**Status: fixed.** Identity guard (fp + ENTHALPY at pressure, capped at
+5e-3/5e-3 so coarse run thresholds cannot over-prune) in three places:
+`_update_saddle` rejects at registration (`_register_probe` still keeps the
+discovered endpoint minimum); `_validate_saddle` flags existing fakes so
+validate_graph/revalidate self-heal old graphs. The comparator must be
+H = E + P·V — Si D1 S13 escaped a raw-energy gate via P·dV (found during
+the self-heal demo; regression test covers it). Demos: Si D1 s42 auto-
+rejects S21+S13+S28 → falls back to 1.2678 Imma; CdSe auto-rejects S5
+(≈M6). 61/61 tests.
+
+### Original finding
 
 `_update_saddle` dedups new saddles against saddle rows only; a dimer result
 that is actually an existing MINIMUM registers as a new saddle. Observed:

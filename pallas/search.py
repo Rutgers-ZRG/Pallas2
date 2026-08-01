@@ -10,7 +10,8 @@ from ase.io import read
 
 # ── Main PALLAS class ────────────────────────────────────────────────
 from pallas.analysis import AnalysisMixin
-from pallas.config import PallasConfig
+from pallas.config import (EDGE_INVARIANT_TOL, SADDLE_MIN_IDENTITY_DFP,
+                           SADDLE_MIN_IDENTITY_EDIFF, PallasConfig)
 from pallas.graph import k_best_paths, minimax_path_kinetic
 from pallas.optimize import local_optimization
 from pallas.probes import ProbeMixin, probe_compute
@@ -736,12 +737,47 @@ class Pallas(ProbeMixin, AnalysisMixin):
                 stats['invalid'] += 1
                 stats['pruned'] += 1
 
+        # D6 sweep: refinement/energy updates elsewhere may have broken
+        # the H_sad >= H_min adjacency invariant
+        stats['invariant_edges_pruned'] = len(self._enforce_edge_invariant())
+
         self._save_state()
 
         print(f"\nValidation complete: {stats['valid']} valid, "
               f"{stats['invalid']} invalid, {stats['pruned']} pruned, "
-              f"{stats['new_edges']} new edges")
+              f"{stats['new_edges']} new edges, "
+              f"{stats['invariant_edges_pruned']} invariant edges pruned")
         return stats
+
+    def _enforce_edge_invariant(self, nodes=None, tol=EDGE_INVARIANT_TOL):
+        """Remove S—M edges whose saddle sits below the minimum by > tol.
+
+        Registration refuses such edges, but refinement can create them
+        later (D6): a lowered saddle is no longer that minimum's adjacent
+        saddle, and kinetic minimax would read the negative local barrier
+        as ~0. Sub-tolerance violations are noise-flat connections — kept.
+
+        Returns list of (saddle_xname, minimum_xname) pairs removed.
+        """
+        pool = list(nodes) if nodes is not None else list(self.G.nodes)
+        removed = []
+        for n in pool:
+            if (n not in self.G
+                    or not self.G.nodes[n].get('xname', '').startswith('S')):
+                continue
+            for m in list(self.G.neighbors(n)):
+                if not self.G.nodes[m].get('xname', '').startswith('M'):
+                    continue
+                gap = self.G.nodes[n]['e'] - self.G.nodes[m]['e']
+                if gap < -tol:
+                    self.G.remove_edge(n, m)
+                    removed.append((self.G.nodes[n]['xname'],
+                                    self.G.nodes[m]['xname']))
+                    print(f"  edge invariant: removed "
+                          f"{self.G.nodes[m]['xname']}—"
+                          f"{self.G.nodes[n]['xname']} "
+                          f"(saddle {gap:+.4f} eV below minimum)")
+        return removed
 
     def unconverged_saddle_ids(self, nodes=None):
         """Saddle node ids whose stored dimer search did not converge.
@@ -1119,8 +1155,23 @@ class Pallas(ProbeMixin, AnalysisMixin):
         sad_dists = [(x.id, fp_distance(fps, np.array(x.data['fp']), types),
                       x.data['energy'])
                      for x in self.db.select(ctyp='saddle')]
-        min_dists = [(x.id, fp_distance(fps, np.array(x.data['fp']), types))
+        min_dists = [(x.id, fp_distance(fps, np.array(x.data['fp']), types),
+                      x.data['energy'], x.volume)
                      for x in self.db.select(ctyp='minima')]
+
+        # D7 guard: a "saddle" identical to a known minimum IS that minimum.
+        # Compare ENTHALPY, not raw energy — at pressure, a volume
+        # difference shifts E by P·dV even for the same structure.
+        press = self.config.press
+        hs = es + press * saddle.get_volume()
+        dfp_id = min(self.config.dist_threshold, SADDLE_MIN_IDENTITY_DFP)
+        de_id = min(self.config.ediff, SADDLE_MIN_IDENTITY_EDIFF)
+        for xid, d, ex, vx in min_dists:
+            dh = abs(hs - (ex + press * vx))
+            if d < dfp_id and dh < de_id:
+                print(f"  saddle REJECTED: identical to minimum M{xid} "
+                      f"(d={d:.5f}, dH={dh:.5f}) — not a saddle")
+                return None, False
 
         isnew = True
         ids = None
@@ -1147,7 +1198,7 @@ class Pallas(ProbeMixin, AnalysisMixin):
         for xid, d, _ in sad_dists:
             if xid != ids:
                 self.update_dij(ids, xid, d)
-        for xid, d in min_dists:
+        for xid, d, _, _ in min_dists:
             self.update_dij(ids, xid, d)
 
         return ids, isnew
@@ -1250,6 +1301,11 @@ class Pallas(ProbeMixin, AnalysisMixin):
                     'dimer_mode': re.dimer_mode.tolist(),
                     'curvature': float(curv), 'converged': True,
                     'refined': True})
+                # D6: the lowered saddle may now sit below a flanking
+                # minimum — that adjacency is no longer valid
+                pruned = self._enforce_edge_invariant(nodes=[n])
+                if pruned:
+                    entry['edges_pruned'] = pruned
                 entry['dH'] = float(dH)
                 entry['accepted'] = True
             print(f"  refine {entry['saddle']}: accepted={entry['accepted']} "
