@@ -705,26 +705,13 @@ class SolidStateDimer:
             step_count += 1
             Ftrans = self.get_forces()
 
-            # QuickMin velocity update
-            dV = Ftrans * self.time_step
-            if np.vdot(V, Ftrans) > 0:
-                V = dV * (1.0 + np.vdot(dV, V) / max(np.vdot(dV, dV), EPSILON))
-            else:
-                V = dV
-
-            # Step with max_step clipping
-            step = V * self.time_step
-            step_mag = self._vector_magnitude(step)
-            if step_mag > self.max_step:
-                step = self.max_step * step / step_mag
-
-            self.set_positions(self.get_positions() + step)
-
-            # Convergence check (TSASE-style: fmax AND negative curvature)
+            # Convergence test on the JUST-EVALUATED geometry, before any
+            # move — the returned saddle must be the point whose forces
+            # passed the test (TSASE-style: fmax AND negative curvature)
             max_force = max(self._vector_magnitude(Ftrans[i])
                             for i in range(len(Ftrans)))
             curv = self.curvature if self.curvature is not None else 1.0
-            E = self.central_energy  # same geometry as Ftrans (pre-step)
+            E = self.central_energy  # same geometry as Ftrans
 
             # Log
             if flog is not None:
@@ -745,7 +732,8 @@ class SolidStateDimer:
                 break
 
             # Stuck at a minimum: forces ~ 0 but curvature > 0
-            # Re-kick with a random perturbation to escape
+            # Re-kick with a random perturbation to escape (in place of
+            # the translation step, which would be negligible here)
             if max_force < fmax and curv > 0:
                 kick = self._generate_kick()
                 kick_step = kick * self.max_step * 0.5
@@ -755,6 +743,22 @@ class SolidStateDimer:
                     flog.write(f"# Re-kick at step {step_count} "
                                f"(stuck at minimum, κ={curv:.4f})\n")
                     flog.flush()
+                continue
+
+            # QuickMin velocity update
+            dV = Ftrans * self.time_step
+            if np.vdot(V, Ftrans) > 0:
+                V = dV * (1.0 + np.vdot(dV, V) / max(np.vdot(dV, dV), EPSILON))
+            else:
+                V = dV
+
+            # Step with max_step clipping
+            step = V * self.time_step
+            step_mag = self._vector_magnitude(step)
+            if step_mag > self.max_step:
+                step = self.max_step * step / step_mag
+
+            self.set_positions(self.get_positions() + step)
 
         if flog is not None:
             status = "converged" if self.converged_flag else "not converged"
