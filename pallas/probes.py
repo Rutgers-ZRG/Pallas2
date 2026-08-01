@@ -238,8 +238,8 @@ def probe_compute(current, target_fp, types, cfg, step_scale=None,
     err = None
     for attempt in range(cfg.max_retries + 1):
         try:
-            base = cfg.fp_step_scale if step_scale is None else step_scale
-            scale = base * (0.5 ** attempt)
+            base_scale = cfg.fp_step_scale if step_scale is None else step_scale
+            scale = base_scale * (0.5 ** attempt)
             cand = fp_guided_saddle(current, mode, scale, cfg,
                                     traj_frames=traj_frames)
             e_cand = float(cand.get_potential_energy())

@@ -222,8 +222,10 @@ def cal_saddle(patoms, fmax=0.01, steps=2000, calc=None, mode=None,
         if traj_frames is not None:
             dyn.attach(lambda: traj_frames.append(atoms.copy()), interval=10)
         dyn.run(fmax=fmax, steps=steps)
-        d.get_forces()  # capture curvature (ASE wrapper workaround)
-        actual_fmax = np.max(np.abs(atoms.get_forces()))
+        f_gen = d.get_forces()  # capture curvature (ASE wrapper workaround)
+        # Same criterion as the quickmin path: max row norm of the
+        # generalized dimer force, cell rows included
+        actual_fmax = d.gradient_norm(f_gen.ravel())
         atoms.converged = (actual_fmax <= fmax
                            and d.curvature is not None
                            and d.curvature < 0)

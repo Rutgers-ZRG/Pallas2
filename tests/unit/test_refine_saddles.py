@@ -70,6 +70,11 @@ def test_refine_accepts_in_place_and_updates_graph(tmp_path, monkeypatch):
     assert p.G.nodes[sid]['e'] == pytest.approx(0.5 + r['dH'], abs=1e-8)
     assert p.G.edges[1, sid]['weight'] == pytest.approx(
         max(0.0, p.G.nodes[sid]['e']))
+    # refinement must persist the updated graph to disk (summary.json and
+    # graph.pkl otherwise disagree by the refinement dH)
+    import joblib
+    g_disk = joblib.load('graph.pkl')
+    assert g_disk.nodes[sid]['e'] == pytest.approx(p.G.nodes[sid]['e'])
 
 
 def test_refine_rejects_drift(tmp_path, monkeypatch):

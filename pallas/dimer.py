@@ -53,11 +53,11 @@ class SolidStateDimer:
             Time step for dynamics (used in QuickMin/Lanczos)
         dimer_separation : float, default=0.001
             Separation between the two dimer images
-        rotation_tolerance : float, default=5.0
+        rotation_tolerance : float, default=15.0
             Convergence tolerance for dimer rotation (degrees)
         max_rotations : int, default=4
             Maximum number of rotation steps per translation step
-        solid_state : bool, default=False
+        solid_state : bool, default=True
             Whether to perform solid-state dimer (with cell optimization)
         external_stress : ndarray, optional
             External stress tensor (3x3 matrix, must be in lower triangular form)
@@ -105,6 +105,7 @@ class SolidStateDimer:
 
         # Initialize optimization state
         self.curvature = None
+        self.central_energy = None
         self.modified_forces = None
 
         # BFGS specific parameters
@@ -487,6 +488,9 @@ class SolidStateDimer:
 
         # Calculate initial forces
         central_forces = self._calculate_general_forces(self.atoms)
+        # Energy at the central point — free cache hit while the calculator
+        # still holds this geometry (endpoint evals below evict it)
+        self.central_energy = self.atoms.get_potential_energy()
 
         # Set up and get forces for first dimer endpoint
         self._update_dimer_endpoint(self.mode, self.atoms, self.dimer_image)
@@ -720,7 +724,7 @@ class SolidStateDimer:
             max_force = max(self._vector_magnitude(Ftrans[i])
                             for i in range(len(Ftrans)))
             curv = self.curvature if self.curvature is not None else 1.0
-            E = self.atoms.get_potential_energy()
+            E = self.central_energy  # same geometry as Ftrans (pre-step)
 
             # Log
             if flog is not None:
@@ -815,7 +819,10 @@ class SolidStateDimer:
 
     def __getattr__(self, attr):
         """Pass through attributes not found to the atoms object."""
-        if hasattr(self, 'atoms'):
-            return getattr(self.atoms, attr)
-        raise AttributeError(f"'{self.__class__.__name__}' object has no attribute '{attr}'")
+        if attr == 'atoms':
+            # atoms not yet in __dict__ (e.g. during unpickling) — recursing
+            # through hasattr would hit RecursionError, not AttributeError
+            raise AttributeError(
+                f"'{self.__class__.__name__}' object has no attribute 'atoms'")
+        return getattr(self.atoms, attr)
 

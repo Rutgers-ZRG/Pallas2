@@ -1048,14 +1048,19 @@ class Pallas(ProbeMixin, AnalysisMixin):
         em = minima.get_potential_energy()
         types = self._get_types(minima)
 
+        # Single DB pass per ctyp; each pair distance computed once and
+        # reused for both dedup and the distance matrix.
+        min_dists = [(x.id, fp_distance(fpm, np.array(x.data['fp']), types),
+                      x.data['energy'])
+                     for x in self.db.select(ctyp='minima')]
+        sad_dists = [(x.id, fp_distance(fpm, np.array(x.data['fp']), types))
+                     for x in self.db.select(ctyp='saddle')]
+
         isnew = True
         idm = None
-        for x in self.db.select(ctyp='minima'):
-            fpx = np.array(x.data['fp'])
-            d = fp_distance(fpm, fpx, types)
-            ediff = abs(em - x.data['energy'])
-            if d < self.config.dist_threshold and ediff < self.config.ediff:
-                idm = x.id
+        for xid, d, ex in min_dists:
+            if d < self.config.dist_threshold and abs(em - ex) < self.config.ediff:
+                idm = xid
                 isnew = False
                 break
 
@@ -1066,13 +1071,11 @@ class Pallas(ProbeMixin, AnalysisMixin):
             )
 
         # Update distance matrix
-        for x in self.db.select(ctyp='minima'):
-            if x.id != idm:
-                fpx = np.array(x.data['fp'])
-                self.update_dij(idm, x.id, fp_distance(fpm, fpx, types))
-        for x in self.db.select(ctyp='saddle'):
-            fpx = np.array(x.data['fp'])
-            self.update_dij(idm, x.id, fp_distance(fpm, fpx, types))
+        for xid, d, _ in min_dists:
+            if xid != idm:
+                self.update_dij(idm, xid, d)
+        for xid, d in sad_dists:
+            self.update_dij(idm, xid, d)
 
         return idm, isnew
 
@@ -1082,14 +1085,19 @@ class Pallas(ProbeMixin, AnalysisMixin):
         es = saddle.get_potential_energy()
         types = self._get_types(saddle)
 
+        # Single DB pass per ctyp; each pair distance computed once and
+        # reused for both dedup and the distance matrix.
+        sad_dists = [(x.id, fp_distance(fps, np.array(x.data['fp']), types),
+                      x.data['energy'])
+                     for x in self.db.select(ctyp='saddle')]
+        min_dists = [(x.id, fp_distance(fps, np.array(x.data['fp']), types))
+                     for x in self.db.select(ctyp='minima')]
+
         isnew = True
         ids = None
-        for x in self.db.select(ctyp='saddle'):
-            fpx = np.array(x.data['fp'])
-            d = fp_distance(fps, fpx, types)
-            ediff = abs(es - x.data['energy'])
-            if d < self.config.dist_threshold and ediff < self.config.ediff:
-                ids = x.id
+        for xid, d, ex in sad_dists:
+            if d < self.config.dist_threshold and abs(es - ex) < self.config.ediff:
+                ids = xid
                 isnew = False
                 break
 
@@ -1104,13 +1112,11 @@ class Pallas(ProbeMixin, AnalysisMixin):
                 data['curvature'] = float(curvature)
             ids = self.db.write(saddle, ctyp='saddle', data=data)
 
-        for x in self.db.select(ctyp='saddle'):
-            if x.id != ids:
-                fpx = np.array(x.data['fp'])
-                self.update_dij(ids, x.id, fp_distance(fps, fpx, types))
-        for x in self.db.select(ctyp='minima'):
-            fpx = np.array(x.data['fp'])
-            self.update_dij(ids, x.id, fp_distance(fps, fpx, types))
+        for xid, d, _ in sad_dists:
+            if xid != ids:
+                self.update_dij(ids, xid, d)
+        for xid, d in min_dists:
+            self.update_dij(ids, xid, d)
 
         return ids, isnew
 
@@ -1209,6 +1215,7 @@ class Pallas(ProbeMixin, AnalysisMixin):
                   f"dH={entry['dH']:+.4f} dfp={entry['dfp']:.4f} "
                   f"k={entry['curvature']} {entry['reason']}")
             report.append(entry)
+        self._save_state()
         return report
 
     def find_best_path(self, k=1):

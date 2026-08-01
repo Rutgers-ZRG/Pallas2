@@ -1,5 +1,6 @@
 docs/*
 !docs/benchmarks.md
+!docs/numerics-review-2026-07.md
 __pycache__/
 *.pyc
 *.log
