@@ -747,7 +747,7 @@ class SolidStateDimer:
             # Stuck at a minimum: forces ~ 0 but curvature > 0
             # Re-kick with a random perturbation to escape
             if max_force < fmax and curv > 0:
-                kick = self._random_vector(np.zeros_like(Ftrans))
+                kick = self._generate_kick()
                 kick_step = kick * self.max_step * 0.5
                 self.set_positions(self.get_positions() + kick_step)
                 V = kick * self.time_step  # reset velocity along kick
@@ -766,6 +766,26 @@ class SolidStateDimer:
             status = "converged" if self.converged_flag else "not converged"
             print(f"  dimer {status} after {step_count} steps "
                   f"({self.force_evaluations} force calls)")
+
+    def _generate_kick(self):
+        """Random escape kick respecting the generalized-coordinate gauge.
+
+        The Voigt→3×3 stress mapping fills only the lower triangle, which
+        assumes the cell stays lower-triangular: the cell block must be
+        LT or the cell acquires a rotation the forces can never undo (and
+        the stored mode ends up in a rotated frame after the final LT
+        projection). Atom 0 is pinned to match gen_random_mode's
+        translation gauge — except for single-atom systems, where the only
+        atom carries the whole PES-relevant displacement.
+        """
+        kick = self._random_vector(np.zeros_like(self.mode))
+        if self.solid_state:
+            if self.num_atoms > 1:
+                kick[0] = 0.0
+            kick[-3, 1:] = 0.0
+            kick[-2, 2] = 0.0
+            kick = self._normalize_vector(kick)
+        return kick
 
     # ── ASE Optimizable protocol ──────────────────────────────────────
     # These methods let ASE's FIRE/BFGS use the dimer's own get_forces

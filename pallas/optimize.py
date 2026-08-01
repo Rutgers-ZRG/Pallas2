@@ -230,11 +230,14 @@ def cal_saddle(patoms, fmax=0.01, steps=2000, calc=None, mode=None,
                            and d.curvature is not None
                            and d.curvature < 0)
 
-    atoms.dimer_mode = d.mode.copy()
     atoms.dimer_curvature = d.curvature
 
+    old_cell = atoms.cell.array.copy()
     new_cell = lower_triangular_cell(atoms)
     atoms.set_cell(new_cell, scale_atoms=True)
+    # Keep the stored mode in the same frame as the stored structure —
+    # identity whenever the run stayed in the LT gauge
+    atoms.dimer_mode = rotate_mode_with_cell(d.mode, old_cell, new_cell, natom)
 
     if hasattr(atoms, 'invalidate_fp'):
         atoms.invalidate_fp()
@@ -274,6 +277,24 @@ def getx(cell1, cell2):
     except Exception:
         mode = np.zeros((nat + 3, 3))
     return mode
+
+
+def rotate_mode_with_cell(mode, old_cell, new_cell, natom):
+    """Rotate a generalized mode across a cell-frame change new = old @ R.
+
+    ``lower_triangular_cell`` + ``set_cell(scale_atoms=True)`` rigidly
+    rotates the structure; a mode captured in the old frame must rotate
+    with it or ±mode pushes and stored-mode refinement act along a wrong
+    direction. Atomic rows are Cartesian vectors (→ @ R); the strain
+    block M generates cell displacements cell·M, so M → Rᵀ M R.
+    """
+    R = np.linalg.solve(old_cell, new_cell)
+    if np.allclose(R, np.eye(3), atol=1e-12):
+        return mode.copy()
+    out = mode.copy()
+    out[:natom] = mode[:natom] @ R
+    out[-3:] = R.T @ mode[-3:] @ R
+    return out
 
 
 def lower_triangular_cell(atoms):
