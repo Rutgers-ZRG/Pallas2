@@ -86,8 +86,9 @@ def main():
         p.init_minima.append(pa)
 
     path0, bn0 = minimax_path_kinetic(p.G, 1, 2)
-    print(f"before: bottleneck {bn0:.4f} | "
-          f"{' -> '.join(p.G.nodes[n]['xname'] for n in path0)}")
+    # capture names now — validation may prune nodes on this path
+    path0_names = [p.G.nodes[n]['xname'] for n in path0]
+    print(f"before: bottleneck {bn0:.4f} | {' -> '.join(path0_names)}")
 
     if args.path_only:
         vstats = {'total': 0, 'valid': 0, 'invalid': 0, 'pruned': 0}
@@ -129,7 +130,7 @@ def main():
           f"{' -> '.join(p.G.nodes[n]['xname'] for n in path2)}")
 
     result = {'before_ev': float(bn0),
-              'path_before': [p.G.nodes[n]['xname'] for n in path0],
+              'path_before': path0_names,
               'validation': vstats,
               'refinement': report,
               'after_ev': float(bn2),
