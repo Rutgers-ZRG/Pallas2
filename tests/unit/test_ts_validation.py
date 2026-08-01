@@ -36,6 +36,38 @@ def test_saddle_registration_persists_mode_and_curvature(tmp_path, monkeypatch):
     assert np.asarray(row.data['dimer_mode']).shape == (5, 3)
 
 
+def test_converged_flag_persisted_and_counted(tmp_path, monkeypatch):
+    """D4 minimal: _update_saddle persists .converged; unconverged saddles
+    are queryable graph-wide and per-path; pre-flag rows count as unknown."""
+    monkeypatch.chdir(tmp_path)
+    p = Pallas(PallasConfig(znucl=[29], natx=30))
+    import ase.db
+    p.db = ase.db.connect('pallas.db')
+    p._probe_stats = {}
+
+    bad = _fake_saddle(e=1.0)
+    bad.converged = False
+    sid_bad, _ = p._update_saddle(bad)
+    assert p.db.get(id=sid_bad).data['converged'] is False
+
+    good = _fake_saddle(e=2.0)  # ediff > threshold -> new row despite same FP
+    good.converged = True
+    sid_good, _ = p._update_saddle(good)
+    assert p.db.get(id=sid_good).data['converged'] is True
+
+    legacy = _fake_saddle(e=3.0)  # no .converged attr (pre-flag DB row)
+    sid_legacy, _ = p._update_saddle(legacy)
+    assert 'converged' not in p.db.get(id=sid_legacy).data
+
+    for sid in (sid_bad, sid_good, sid_legacy):
+        p.G.add_node(sid, xname=f'S{sid}', e=1.0, volume=1.0)
+    p.G.add_node(99, xname='M99', e=0.0, volume=1.0)
+
+    assert p.unconverged_saddle_ids() == [sid_bad]
+    assert p.unconverged_saddle_ids([99, sid_good, sid_legacy]) == []
+    assert p.unconverged_saddle_ids([99, sid_bad]) == [sid_bad]
+
+
 def test_validate_saddle_escalates_push(monkeypatch):
     """If ±push lands in the same basin, the validator must retry with a
     larger push before giving up."""

@@ -58,12 +58,21 @@ to dimer dynamics, and the same vector sets the escape sign in
 an intentional bias toward cell-driven transitions (then document it) or an
 oversight (then divide by jacob² and re-benchmark search efficiency).
 
-## D4 — Unconverged/positive-curvature dimer results enter the graph as saddles (open, minimal fix pending)
+## D4 — Unconverged/positive-curvature dimer results enter the graph as saddles (minimal fix applied; gating deferred)
 
 `fp_guided_saddle` falls back to the best-curvature attempt without requiring
 κ<0 or convergence; `probe_compute` gates only on finite energy, volume
-ratio, and rise cap; the `converged` flag is not persisted to the DB.
-±push connectivity can pass a non-first-order ridge point, and when
-refinement rejects, the loose energy stays on the path with only a flag.
-Minimal numerics-neutral fix (not yet applied): persist `converged` in
-`_update_saddle`, report unconverged-saddle counts in the summary.
+ratio, and rise cap. ±push connectivity can pass a non-first-order ridge
+point, and when refinement rejects, the loose energy stays on the path with
+only a flag.
+
+**Applied (numerics-neutral, 2026-07-31):** `_update_saddle` persists the
+`converged` flag; `Pallas.unconverged_saddle_ids(nodes=None)` queries it;
+`summary.json` gains `n_saddles_unconverged` + `path_saddles_unconverged`
+and the CLI warns when the final path carries unconverged saddles.
+`PallasAtom.converged` default changed False→None (tri-state: None =
+never dimered/optimized; rows written by ≤v1.0.1 have no flag = unknown).
+
+**Still deferred (changes search numerics):** actually gating registration
+on convergence/curvature in `probe_compute`, or down-weighting unconverged
+saddles in the graph.

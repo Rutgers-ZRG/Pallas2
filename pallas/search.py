@@ -743,6 +743,35 @@ class Pallas(ProbeMixin, AnalysisMixin):
               f"{stats['new_edges']} new edges")
         return stats
 
+    def unconverged_saddle_ids(self, nodes=None):
+        """Saddle node ids whose stored dimer search did not converge.
+
+        Parameters
+        ----------
+        nodes : iterable, optional — restrict to these node ids (e.g. a
+            path); default = every saddle node in the graph.
+
+        Returns
+        -------
+        list of node ids with a stored ``converged=False`` flag. Rows
+        written before the flag existed have no entry and are treated as
+        unknown (not returned).
+        """
+        pool = list(nodes) if nodes is not None else list(self.G.nodes)
+        ids = []
+        for n in pool:
+            if n not in self.G:
+                continue
+            if not self.G.nodes[n].get('xname', '').startswith('S'):
+                continue
+            try:
+                row = self.db.get(id=n)
+            except Exception:
+                continue
+            if row.data.get('converged') is False:
+                ids.append(n)
+        return ids
+
     def _closest_to(self, minima_list, target_fp, types):
         """Return the minimum from the list closest to target in FP space."""
         best = minima_list[0]
@@ -1110,6 +1139,9 @@ class Pallas(ProbeMixin, AnalysisMixin):
             curvature = getattr(saddle, 'dimer_curvature', None)
             if curvature is not None:
                 data['curvature'] = float(curvature)
+            converged = getattr(saddle, 'converged', None)
+            if converged is not None:
+                data['converged'] = bool(converged)
             ids = self.db.write(saddle, ctyp='saddle', data=data)
 
         for xid, d, _ in sad_dists:

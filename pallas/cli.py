@@ -113,6 +113,10 @@ def cmd_run(args):
                         if d.get('xname', '').startswith('M')),
         'n_saddles': sum(1 for _, d in nodes(data=True)
                          if d.get('xname', '').startswith('S')),
+        'n_saddles_unconverged': len(pallas.unconverged_saddle_ids()),
+        'path_saddles_unconverged': [
+            int(n) for n in (pallas.unconverged_saddle_ids(path)
+                             if path else [])],
         'runtime_s': round(time.time() - t0, 1),
         'commit': _commit_id(),
         'validation': validation,
@@ -124,6 +128,12 @@ def cmd_run(args):
     if path:
         from pallas.plotting import profile_png
         profile_png(names, hvals, spgs, 'profile.png')
+        unconv_path = summary['path_saddles_unconverged']
+        if unconv_path:
+            print(f"\nWARNING: {len(unconv_path)} saddle(s) on the final "
+                  f"path never converged in the dimer search "
+                  f"({', '.join('S%d' % n for n in unconv_path)}) — "
+                  f"barrier may be loose")
         print(f"\nbarrier = {barrier:.4f} eV | results in {workdir}")
     else:
         print(f"\nNo path found in {args.max_gen} generations "

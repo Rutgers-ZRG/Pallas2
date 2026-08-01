@@ -18,7 +18,8 @@ class PallasAtom(Atoms):
         self.natx = 200
         self.fpcutoff = 5.5
         self.fp = None
-        self.converged = False
+        self.converged = None   # None = never optimized/dimered (unknown);
+                                # local_optimization/cal_saddle set True/False
         self.id = None
         self._znucl = None
 
