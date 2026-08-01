@@ -136,3 +136,40 @@ CdSe-MS and Si exact, NaCl reproduced with better seed agreement
 (0.1012 ± 0.0004 eV over 3 seeds), CdSe-NequIP and carbon within their
 seed spreads. Paper numbers need no revision; NaCl may optionally be quoted
 with the 3-seed convergence statement.
+
+## D1 re-benchmark (2026-08-01, commit c632712 + guards 68b706d, tag bench/carbon-d1fix-20260801)
+
+Re-run of all four systems after the D1 fix (QuickMin convergence checked
+BEFORE stepping — returned saddles are now the force-checked geometry).
+This round also exercised (and hardened) the self-audit guards: two
+fake-saddle artifact classes surfaced in early D1 draws and are now caught
+in-pipeline (D6 edge invariant, D7 minimum-identity with enthalpy
+comparison; docs/numerics-review-2026-07.md). All final numbers below are
+post-guard, screen-clean (benchmarks/screen_path_saddles.py).
+
+| System | v1.0.1 FINAL | D2 | D1 (validated + refined) |
+|---|---|---|---|
+| CdSe MatterSim | 0.0260 | 0.0260 | **0.0265** best-of-3 (0.0546 direct-only draw / 0.0270 / 0.0265, 2-step S3+S6) |
+| CdSe NequIP | 0.0282 | 0.0360 | **0.0309** (raw "0.0000" draw self-healed by the guards: fake S5 rejected, M1—S16 edge pruned, re-path+refine automatic) |
+| Si @12 GPa | 1.2675 | 1.2677 (+1.2560 3-step) | **1.2677 / 1.2677 / 1.2678** — all three seeds converge on Imma after auto-rejection of M2-duplicate fakes (S21/S13/S28) |
+| NaCl @30 GPa | 0.1018 | 0.1009/0.1012/0.1016 | **0.1010** (s42 direct S17, refined −0.042) / 0.1419 / 0.1405 — the 0.10-class collective route is draw-dependent; 0.14-class is its reproducible ceiling |
+| C @15 GPa | 2.4509 best-of-3 | 2.2427† / 2.5500 / 2.6912† | 4.1855 / 2.9524† / **2.9441** (clean, single-step S5 refined in place) |
+
+† bottleneck refine-unconverged (800-step budget) — energy kept per guarded-acceptance protocol.
+
+Observations:
+- **The FINAL table survives its second independent re-measurement.**
+  CdSe-MS and Si essentially exact; NaCl best-of-3 within 1 meV of 0.1018;
+  CdSe-NequIP inside its flat-PES draw band (0.028–0.062 across all
+  post-fix draws).
+- **Carbon seed variance is the paper-relevant caveat**: raw best-of-3
+  spans 2.24–4.19 eV across the 9 post-fix seeds (D1+D2+v1.0.1). Quote
+  carbon as best-of-N with N stated; the clean-refined post-fix set is
+  2.4509 (v1.0.1) / 2.5500 (D2) / 2.9441 (D1).
+- CdSe-NequIP "barrierless" draws are artifacts of a genuinely flat PES
+  plus (pre-guard) graph bookkeeping — with guards on, every draw lands at
+  0.03–0.06 eV. Recommend quoting a range (≈0.03–0.06 eV), not a point.
+- The NaCl s42 crash under pre-guard code did not reproduce under the
+  guarded pipeline (full unfiltered rerun log: runs/nacl-d1-s42-full.log).
+- Amarel: /scratch/lz432/pallas_d1fix, jobs 5820078–80 (search),
+  5820082/5820114/5820115 (revalidate --path-only).
