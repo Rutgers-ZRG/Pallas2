@@ -122,3 +122,32 @@ rate-limiting saddle is unrefined (seen on NaCl: three near-degenerate
 refine-bottleneck→re-path to a fixed point (scratch
 `refine_until_stable.py`); consider folding that loop into the CLI/
 revalidate flow once D5 is fixed.
+
+## D6 — refinement can break the edge invariant H_sad ≥ H_min (found 2026-08-01, OPEN)
+
+`_register_probe` refuses edges with H_sad ≤ H_min at registration, but
+`refine_path_saddles` can later LOWER a saddle below a flanking minimum and
+nothing re-audits the edges; kinetic minimax then reports a zero/negative
+local barrier as 0 (observed: CdSe-NequIP D1, S16 refined −17.7 meV to
+−2.8 meV below M1 → quoted barrier 0.0000; invariant-enforced re-path gives
+0.0374). **Proposed fix:** after each accepted refinement, drop (or flag)
+edges violating H_sad ≥ H_min − 1 meV and re-extract. Post-hoc scan:
+`benchmarks/screen_path_saddles.py`.
+
+## D7 — cross-type dedup hole: a "saddle" can be a known minimum (found 2026-08-01, OPEN)
+
+`_update_saddle` dedups new saddles against saddle rows only; a dimer result
+that is actually an existing MINIMUM registers as a new saddle. Observed:
+Si D1 s42 route M1→S14→M5(sh)→S21→M2 quoted 1.1204 eV, where S21 (and the
+alternate S13) are M2 duplicates (d_fp 0.003, flat interpolation profile,
+κ>0 from all random dimer starts) — the M5→M2 leg's true saddle was never
+found, so the route is not quotable. Signature: near-zero local barrier on
+one side. **Proposed fix:** registration- and validation-time identity check
+of saddles against all minima at tight thresholds (5e-3), plus multi-start
+curvature confirmation for any path saddle with min-side barrier < 5 meV.
+Deep-check tool: `benchmarks/validate_zero_barrier.py` (identity + tight
+re-relax + multi-start fixed-geometry curvature + interpolated ridge scan).
+
+**Fleet screen 2026-08-01:** all v1.0.1 FINAL paths and all D2 paths pass
+the min-side-barrier screen; only the two D1 draws above are affected
+(corrected: CdSe-NequIP 0.0374, Si falls back to 1.2677).
