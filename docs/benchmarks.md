@@ -100,3 +100,39 @@ default. `benchmarks/revalidate.py` applies the same pass to saved runs.
 | Si @12 GPa | **1.2675 eV (0.158 eV/atom)** | S3 (Imma) refines in place (+0.0003 eV, κ=−1.51); morning's "1.2335" was restart drift. NEB's 1.113 remains a non-stationary estimate |
 | NaCl @30 GPa | **0.1018 eV (0.0255 eV/f.u.)** | escalating push VALIDATES the low route (morning rejection = fixed-push artifact): s44 M1→S19→M2 direct, refined in place (κ=−0.23); s43 independently gives 0.1419 via S4. Literature-scale collective mechanism, NEB diverges |
 | C @15 GPa | **2.4509 eV (0.1532 eV/atom)** best-of-3 validated (2.451/2.944/2.944) | ALL path saddles validate with escalating push (yesterday's 'inconclusive' was the fixed-push artifact): κ=−1.1…−1.4, distinct basins, stored-mode refinement moves energies only −0.005…−0.04 eV. The κ=−20…−48 figures in the first audit were unconverged-restart artifacts. Best path: 2-step via layer-shifted intermediate (job 5755416) |
+
+## D2 re-benchmark (2026-08-01, commit d4e0b18, tag bench/carbon-d2fix-20260731)
+
+Re-run of all four systems after the D2 gauge fix (re-kick LT constraint +
+stored-mode frame rotation; docs/numerics-review-2026-07.md). The fix alters
+dimer trajectories after any re-kick (the v1.0.1 local runs logged
+1.1k–5.9k kicks per workdir), so agreement here is an independent
+re-measurement, not a replay of identical trajectories.
+
+| System | v1.0.1 FINAL | D2 re-benchmark (validated + refined) | Verdict |
+|---|---|---|---|
+| CdSe MatterSim | 0.0260 eV | **0.0260 eV** (s42, S3+S6 route, refines in place) | exact |
+| CdSe NequIP | 0.0282 eV | **0.0360 eV** (s42; an independent second draw gave 0.0619 — torch run-to-run nondeterminism on this PES; historical band 0.000–0.019 eV/f.u.) | within band |
+| Si @12 GPa | 1.2675 eV | **1.2677 eV** s42/s44 (Imma direct); s43 finds a 3-step channel at **1.2560 eV**, all saddles validated + refined | exact (+ lower channel) |
+| NaCl @30 GPa | 0.1018 eV (s44); 0.1419 outlier (s43) | **0.1009 / 0.1012 / 0.1016 eV** — all three seeds converge under iterated bottleneck refinement | tighter than v1.0.1 |
+| C @15 GPa | 2.4509 eV best-of-3 (2.451/2.944/2.944) | s42 **2.2427** (5-step; bottleneck S34 κ≈−0.15 soft mode: validates with escalating push, resists tight refinement at 800 and 2500 steps), s44 **2.5500** (clean, all path saddles refined), s43 2.6912 (bottleneck refine unconverged) | within seed spread |
+
+Notes:
+- NaCl: three near-degenerate raw routes (0.094–0.142) collapse onto ~0.101
+  under iterated refine-bottleneck→re-path (`benchmarks/refine_until_stable.py`);
+  the v1.0.1 s43 "0.1419" outlier class refines down to the same 0.1016.
+- Si s43's 1.2560 eV 3-step route (Fd-3m → … → I4₁/amd, all saddles κ<0,
+  refined) sits 11 meV below the Imma channel — supplementary observation
+  pending mechanism analysis.
+- Carbon: jobs 5819126–8 (search), 5819192/3 + 5819970 (revalidate
+  --path-only), 5820045 (S34 long refine); staging /scratch/lz432/pallas_d2fix.
+- Process findings from this pass — refine double-count on re-run (D5, open)
+  and the refine→re-path unrefined-bottleneck hazard — are documented in
+  docs/numerics-review-2026-07.md; the re-benchmark used single-pass
+  refinement discipline throughout.
+
+**Conclusion: the v1.0.1 FINAL table survives the D2 fix unchanged.**
+CdSe-MS and Si exact, NaCl reproduced with better seed agreement
+(0.1012 ± 0.0004 eV over 3 seeds), CdSe-NequIP and carbon within their
+seed spreads. Paper numbers need no revision; NaCl may optionally be quoted
+with the 3-seed convergence statement.

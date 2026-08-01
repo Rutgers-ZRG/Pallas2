@@ -29,7 +29,17 @@ the same loop, so the off-by-one is in final numbers too.
 **Fix:** check convergence before stepping (evaluate → check → break → step).
 Same bucket as the QuickMin trust-region item.
 
-## D2 — Re-kick breaks the lower-triangular gauge → stored modes rotate out of frame
+## D2 — Re-kick breaks the lower-triangular gauge → stored modes rotate out of frame — **FIXED + RE-BENCHMARKED (2026-08-01)**
+
+**Status: fixed in `d4e0b18`** (`_generate_kick` LT-constrained + atom-0 pin;
+`rotate_mode_with_cell` keeps stored modes frame-consistent in `cal_saddle`),
+5 gauge tests. Saved v1.0.1 runs had 1.1k–5.9k kicks/workdir (Si/NaCl/CdSe)
+— the path was hot. Re-benchmark of all four systems: see
+`docs/benchmarks.md` D2 section; headline = FINAL numbers reproduced
+(CdSe-MS exact, NaCl 3-seed convergence at 0.101, Si Imma exact +
+a 1.2560 multi-step find), carbon within seed spread.
+
+### Original finding
 
 `dimer.py` stuck-at-minimum re-kick uses a fully random vector: cell block
 not LT-constrained, atom 0 not zeroed (unlike `gen_random_mode` /
@@ -76,3 +86,29 @@ never dimered/optimized; rows written by ≤v1.0.1 have no flag = unknown).
 **Still deferred (changes search numerics):** actually gating registration
 on convergence/curvature in `probe_compute`, or down-weighting unconverged
 saddles in the graph.
+
+## D5 — refine_path_saddles double-counts dH on re-run (found 2026-08-01, OPEN)
+
+Exposed by the finding-1 persistence fix: `refine_path_saddles` applies
+`G.nodes[n]['e'] += dH` with `dH = H(refined) − H(DB row)`. The refined
+energy is persisted to the graph but the DB row is untouched, so a SECOND
+refinement pass (e.g. re-running `benchmarks/revalidate.py` on an
+already-refined workdir — its documented use) re-dimers the original
+structure, gets the same refined energy, and adds dH AGAIN (observed: CdSe
+NequIP S3 0.0539 → 0.0619 → 0.0699 across two passes, +8 meV each).
+Pre-fix this was masked because refinements were never saved. Workaround
+until fixed: exactly one refinement pass per saddle (the CLI does this; the
+D2 re-benchmark used single-pass discipline + per-saddle refine scripts).
+**Proposed fix:** on acceptance, write the refined energy (and ideally
+geometry+mode+fp) back to the DB row so a re-pass yields dH≈0. Needs a
+small design decision on ase.db row update semantics.
+
+## Harness note — refine→re-path can leave an unrefined bottleneck
+
+The CLI refines the best path once, then re-extracts; if refinement raises
+the old bottleneck above a near-degenerate alternative, the NEW route's
+rate-limiting saddle is unrefined (seen on NaCl: three near-degenerate
+~0.09 raw routes each refining to ~0.101). The D2 re-benchmark iterated
+refine-bottleneck→re-path to a fixed point (scratch
+`refine_until_stable.py`); consider folding that loop into the CLI/
+revalidate flow once D5 is fixed.
