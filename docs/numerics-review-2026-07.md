@@ -87,7 +87,17 @@ never dimered/optimized; rows written by ≤v1.0.1 have no flag = unknown).
 on convergence/curvature in `probe_compute`, or down-weighting unconverged
 saddles in the graph.
 
-## D5 — refine_path_saddles double-counts dH on re-run (found 2026-08-01, OPEN)
+## D5 — refine_path_saddles double-counts dH on re-run — **FIXED (2026-08-01)**
+
+**Status: fixed.** On acceptance, the refined saddle is written back to its
+DB row (`db.update`: geometry, energy, fp, dimer_mode, curvature,
+converged, `refined: True`) so a re-pass re-derives dH≈0; idempotency
+regression test added. Caveat: workdirs refined under the PRE-fix code
+(including the D2 re-benchmark dirs) still carry stale rows — the FIRST
+re-pass on those double-counts once before self-correcting; treat their
+existing single-pass numbers as final.
+
+### Original finding
 
 Exposed by the finding-1 persistence fix: `refine_path_saddles` applies
 `G.nodes[n]['e'] += dH` with `dH = H(refined) − H(DB row)`. The refined

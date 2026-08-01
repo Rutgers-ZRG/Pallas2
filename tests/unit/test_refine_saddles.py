@@ -77,6 +77,56 @@ def test_refine_accepts_in_place_and_updates_graph(tmp_path, monkeypatch):
     assert g_disk.nodes[sid]['e'] == pytest.approx(p.G.nodes[sid]['e'])
 
 
+def test_refine_second_pass_is_idempotent(tmp_path, monkeypatch):
+    """D5: accepted refinement must persist to the DB row so a re-run
+    re-derives dH~0 instead of adding the same delta again."""
+    monkeypatch.chdir(tmp_path)
+    start = Atoms('H', positions=[[OFFSET - 0.70, OFFSET + 1.00, 0.0]],
+                  cell=[50.0] * 3, pbc=True)
+    mode = np.zeros((4, 3))
+    d = np.array([MB_SADDLE_XY[0] + 0.70, MB_SADDLE_XY[1] - 1.00, 0.0])
+    mode[0] = d / np.linalg.norm(d)
+    loose = cal_saddle(start, fmax=0.08, steps=2000, calc=MuellerBrown(),
+                       mode=mode)
+
+    p = Pallas(PallasConfig(znucl=[1], natx=20))
+    p.db = ase.db.connect('pallas.db')
+    p._probe_stats = {}
+    from pallas.optimize import set_calculator
+    set_calculator(MuellerBrown())
+
+    for em in (0.0, -0.1):
+        m = _pa(Atoms('H', positions=[[OFFSET, OFFSET, 0]], cell=[50.0] * 3,
+                      pbc=True), e=em)
+        p.db.write(m, ctyp='minima', data={'fp': m.get_fp().tolist(),
+                                           'energy': em})
+    sad = _pa(loose)
+    sad.dimer_mode = loose.dimer_mode
+    sad.dimer_curvature = loose.dimer_curvature
+    sad.calc = MuellerBrown()
+    sid, _ = p._update_saddle(sad)
+    p.G.add_node(1, xname='M1', e=0.0, volume=1.0)
+    p.G.add_node(sid, xname=f'S{sid}', e=0.5, volume=1.0)
+    p.G.add_node(2, xname='M2', e=-0.1, volume=1.0)
+    p.G.add_edge(1, sid, weight=0.5)
+    p.G.add_edge(sid, 2, weight=0.5)
+
+    r1 = p.refine_path_saddles(path=[1, sid, 2], fmax=0.01, steps=2000)
+    assert r1[0]['accepted']
+    e_after_first = p.G.nodes[sid]['e']
+
+    # DB row now carries the refined saddle
+    row = p.db.get(id=sid)
+    assert row.data.get('refined') is True
+    assert row.data['converged'] is True
+
+    # second pass: dH ~ 0, graph energy stable
+    r2 = p.refine_path_saddles(path=[1, sid, 2], fmax=0.01, steps=2000)
+    assert r2[0]['accepted'], r2
+    assert abs(r2[0]['dH']) < 2e-3, f"second pass not idempotent: {r2}"
+    assert p.G.nodes[sid]['e'] == pytest.approx(e_after_first, abs=2e-3)
+
+
 def test_refine_rejects_drift(tmp_path, monkeypatch):
     """If the re-dimer drifts beyond max_drift, keep the original energy."""
     monkeypatch.chdir(tmp_path)

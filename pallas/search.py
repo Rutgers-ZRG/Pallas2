@@ -1241,6 +1241,15 @@ class Pallas(ProbeMixin, AnalysisMixin):
                 for nb in self.G.neighbors(n):
                     self.G.edges[n, nb]['weight'] = max(
                         self.G.nodes[n]['e'], self.G.nodes[nb]['e'])
+                # Persist the refined saddle to its DB row — otherwise a
+                # second refinement pass re-derives dH from the stale row
+                # and double-counts it (D5). ase.db merges data, so every
+                # stale key must be overwritten explicitly.
+                self.db.update(n, atoms=rp, data={
+                    'fp': rp.get_fp().tolist(), 'energy': float(e1),
+                    'dimer_mode': re.dimer_mode.tolist(),
+                    'curvature': float(curv), 'converged': True,
+                    'refined': True})
                 entry['dH'] = float(dH)
                 entry['accepted'] = True
             print(f"  refine {entry['saddle']}: accepted={entry['accepted']} "
