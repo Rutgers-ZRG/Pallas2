@@ -17,6 +17,7 @@ import numpy as np
 
 import sys as _sys
 SEED = int(_sys.argv[1]) if len(_sys.argv) > 1 else 42
+COMMIT = _sys.argv[2] if len(_sys.argv) > 2 else 'bench/carbon-15gpa-20260610'
 random.seed(SEED)
 np.random.seed(SEED)
 
@@ -74,7 +75,7 @@ config = PallasConfig(
 )
 
 with open('config.json', 'w') as f:
-    json.dump({'seed': SEED, 'commit': 'bench/carbon-15gpa-20260610',
+    json.dump({'seed': SEED, 'commit': COMMIT,
                'press_gpa': press_gpa,
                **{k: getattr(config, k) for k in config.__dataclass_fields__}},
               f, indent=1)
